@@ -6,3 +6,6 @@
 .playwright/profile/
 
 node_modules/
+
+# commit-text-generate 的产物（提交文案草稿），不是交付物
+docs/commit-message/
