@@ -1,0 +1,8 @@
+# Playwright CLI output (may contain credentials)
+.playwright-cli/
+
+# Persistent browser profile: local login state, never committed.
+# Keep .playwright/cli.config.json itself tracked.
+.playwright/profile/
+
+node_modules/

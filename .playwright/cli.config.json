@@ -1,0 +1,5 @@
+{
+  "browser": {
+    "userDataDir": ".playwright/profile"
+  }
+}
