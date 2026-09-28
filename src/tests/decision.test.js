@@ -60,6 +60,13 @@ function observe(over) {
 
 function memory(over) { return Object.assign(api.initialMemory(), over) }
 
+// 续播阶梯的账本（docs/adr/0009）：{ key, stage, attempts, dueAt, playingSince }
+//   stage 1 = 第一段（最多 5 次）；stage 2 = 重启之后（最多 3 次）
+//   attempts === 本段上限 表示「最后一次已发出，正在等它是否生效」
+function ladder(over) {
+  return Object.assign({ key: 'mk1', stage: 1, attempts: 0, dueAt: NOW, playingSince: null }, over)
+}
+
 // ---------------------------------------------------------------- 用例
 
 const CASES = [
@@ -178,8 +185,16 @@ const CASES = [
 
   // ---- 媒体异常 ----
   {
-    name: '视频加载失败 → 停下',
+    name: '视频加载失败 → 不再立刻停下，先走续播阶梯',
     obs: observe({ media: media({ failed: true }) }),
+    // 倒计时：5 秒后自动续播（第 1/5 次）
+    expect: { kind: A.WAIT, pending: P.AUTO_RESUME, pendingDueAt: NOW + C.RESUME_INTERVAL_MS },
+    expectMemory: (m) => m.resume && m.resume.stage === 1 && m.resume.key === 'mk1',
+  },
+  {
+    name: '加载失败且阶梯用尽 → 停下，原因仍是加载失败',
+    obs: observe({ media: media({ failed: true }) }),
+    mem: () => memory({ resume: ladder({ stage: 2, attempts: C.RESTART_MAX_ATTEMPTS, dueAt: NOW }) }),
     expect: { kind: A.STOP, reason: R.MEDIA_LOAD_FAILED },
   },
   {
@@ -291,57 +306,167 @@ const CASES = [
     expect: { kind: A.STOP, reason: R.DIALOG_WITHOUT_UNFINISHED },
   },
 
-  // ---- 暂停 ----
+  // ---- 续播阶梯（docs/adr/0009）：暂停/被拒/加载失败不再直接停下 ----
+  //      形状：第一段 5 次 → 重启一次脚本 → 第二段 3 次 → 才真正停下；间隔都是 5 秒
+
+  // 起播那一支：首次请求仍然立刻发（被反转的是「之后」）
   {
-    name: '还没起播的暂停 → 请求起播',
+    name: '还没起播的暂停 → 首次起播请求立刻发出',
     obs: observe({ media: media({ currentTime: 0, paused: true }) }),
     expect: { kind: A.START },
     expectMemory: (m) => m.startRequestedKey === 'mk1',
   },
   {
-    name: '同一个媒体只请求一次起播 → 再看到也只在原地等',
-    obs: observe({ media: media({ currentTime: 0, paused: true }) }),
-    mem: () => memory({ startRequestedKey: 'mk1', pausedSince: NOW - 1000 }),
-    // 倒计时：再等 5 秒还没开始播就判定被拒绝
-    expect: { kind: A.WAIT, pending: P.START_GIVEUP, pendingDueAt: NOW - 1000 + C.START_GIVEUP_MS },
-  },
-  {
     name: '换了媒体（key 变了）→ 允许再请求一次起播',
     obs: observe({ media: media({ key: 'mk2', currentTime: 0, paused: true }) }),
-    mem: () => memory({ startRequestedKey: 'mk1', pausedSince: NOW - 1000 }),
+    mem: () => memory({ startRequestedKey: 'mk1' }),
     expect: { kind: A.START },
   },
   {
-    name: '起播请求过却仍停在原地超过时限 → 停下',
+    name: '请求过起播却仍没动 → 改走续播阶梯（不再 6 秒判被拒）',
     obs: observe({ media: media({ currentTime: 0, paused: true }) }),
-    mem: () => memory({ startRequestedKey: 'mk1', pausedSince: NOW - C.START_GIVEUP_MS }),
+    mem: () => memory({ startRequestedKey: 'mk1' }),
+    // 倒计时：5 秒后自动续播（第 1/5 次）
+    expect: { kind: A.WAIT, pending: P.AUTO_RESUME, pendingDueAt: NOW + C.RESUME_INTERVAL_MS },
+  },
+  {
+    name: '起播始终没动、阶梯用尽 → 停下，原因是被拒',
+    obs: observe({ media: media({ currentTime: 0, paused: true }) }),
+    mem: () => memory({
+      startRequestedKey: 'mk1',
+      resume: ladder({ stage: 2, attempts: C.RESTART_MAX_ATTEMPTS, dueAt: NOW }),
+    }),
     expect: { kind: A.STOP, reason: R.PLAYBACK_REFUSED },
   },
+
+  // 第一段：每 RESUME_INTERVAL_MS 一次，最多 RESUME_MAX_ATTEMPTS 次
   {
-    name: '失焦导致暂停 → 宽限内先等',
-    obs: observe({ media: media({ currentTime: 30, paused: true }), focus: { lost: true } }),
-    mem: () => memory({ pausedSince: NOW - 1000 }),
-    // 倒计时：宽限期一到就停下（不静默续播）
-    expect: { kind: A.WAIT, pending: P.PAUSED, pendingDueAt: NOW - 1000 + C.PAUSE_GRACE_MS },
-  },
-  {
-    name: '失焦导致暂停且已确认 → 停下（不静默续播）',
-    obs: observe({ media: media({ currentTime: 30, paused: true }), focus: { lost: true } }),
-    mem: () => memory({ pausedSince: NOW - C.PAUSE_GRACE_MS }),
-    expect: { kind: A.STOP, reason: R.FOCUS_LOST_PAUSE },
-  },
-  {
-    name: '有焦点时被暂停 → 停下，不跟用户抢',
+    name: '媒体被暂停 → 不再直接停下，先排一次自动续播',
     obs: observe({ media: media({ currentTime: 30, paused: true }) }),
-    mem: () => memory({ pausedSince: NOW - C.PAUSE_GRACE_MS }),
+    // 倒计时：5 秒后自动续播（第 1/5 次）
+    expect: { kind: A.WAIT, pending: P.AUTO_RESUME, pendingDueAt: NOW + C.RESUME_INTERVAL_MS },
+    expectMemory: (m) => m.resume && m.resume.stage === 1 && m.resume.attempts === 0 && m.resume.key === 'mk1',
+  },
+  {
+    name: '失焦后被暂停 → 同样先排自动续播（焦点只在「停下」那一刻用来定原因）',
+    obs: observe({ media: media({ currentTime: 30, paused: true }), focus: { lost: true } }),
+    expect: { kind: A.WAIT, pending: P.AUTO_RESUME },
+  },
+  {
+    name: '续播到点 → 对当前媒体再按一次播放，并排下一次',
+    obs: observe({ media: media({ currentTime: 30, paused: true }) }),
+    mem: () => memory({ resume: ladder({ attempts: 0, dueAt: NOW }) }),
+    expect: { kind: A.AUTO_RESUME, pending: P.AUTO_RESUME },
+    expectMemory: (m) => m.resume.attempts === 1 && m.resume.dueAt === NOW + C.RESUME_INTERVAL_MS,
+  },
+  {
+    name: '续播还没到点 → 原地等，不重复按播放',
+    obs: observe({ media: media({ currentTime: 30, paused: true }) }),
+    mem: () => memory({ resume: ladder({ attempts: 1, dueAt: NOW + 3000 }) }),
+    expect: { kind: A.WAIT, pending: P.AUTO_RESUME, pendingDueAt: NOW + 3000 },
+  },
+  {
+    name: '光标离开窗口那一档（有焦点时的暂停）→ 一样自动续播',
+    obs: observe({ media: media({ currentTime: 30, paused: true }) }),
+    mem: () => memory({ resume: ladder({ attempts: 1, dueAt: NOW }) }),
+    expect: { kind: A.AUTO_RESUME },
+  },
+
+  // 成功判据：连续在播满一个间隔才算真的活了 —— 「起了又被按停」不能算成功，
+  // 否则平台的播放器守卫（1 秒内按停非令牌持有者）会把 5 次上限悄悄变成无限
+  {
+    name: '续播后连续在播满一个间隔 → 判定恢复，账本清空',
+    obs: observe({ media: media({ currentTime: 35, paused: false }) }),
+    mem: () => memory({
+      resume: ladder({ attempts: 1, dueAt: NOW + 9999, playingSince: NOW - C.RESUME_INTERVAL_MS }),
+    }),
+    expect: { kind: A.WAIT, pending: null },
+    expectMemory: (m) => m.resume === null,
+  },
+  {
+    name: '连续在播还没满一个间隔 → 账本留着，不提前清零',
+    obs: observe({ media: media({ currentTime: 35, paused: false }) }),
+    mem: () => memory({ resume: ladder({ attempts: 1, dueAt: NOW + 9999, playingSince: NOW - 1000 }) }),
+    expect: { kind: A.WAIT },
+    expectMemory: (m) => m.resume && m.resume.attempts === 1 && m.resume.playingSince === NOW - 1000,
+  },
+  {
+    name: '续播后不到一个间隔又被按停 → 不清零，接着消耗名额',
+    obs: observe({ media: media({ currentTime: 35, paused: true }) }),
+    mem: () => memory({ resume: ladder({ attempts: 1, dueAt: NOW, playingSince: NOW - 2000 }) }),
+    expect: { kind: A.AUTO_RESUME, pending: P.AUTO_RESUME },
+    expectMemory: (m) => m.resume.attempts === 2 && m.resume.playingSince === null,
+  },
+  {
+    name: '没有阶梯时在播 → 不建立账本',
+    obs: observe({ media: media({ currentTime: 31, paused: false }) }),
+    expect: { kind: A.WAIT },
+    expectMemory: (m) => m.resume === null,
+  },
+  {
+    name: '换了媒体 → 续播账本重新开一轮（另一条媒体另有 5 次）',
+    obs: observe({ media: media({ key: 'mk2', currentTime: 30, paused: true }) }),
+    mem: () => memory({ resume: ladder({ key: 'mk1', attempts: 4, dueAt: NOW }) }),
+    expect: { kind: A.WAIT, pending: P.AUTO_RESUME, pendingDueAt: NOW + C.RESUME_INTERVAL_MS },
+    expectMemory: (m) => m.resume.key === 'mk2' && m.resume.stage === 1 && m.resume.attempts === 0,
+  },
+  {
+    name: '阶梯中途媒体消失 → 账本留着，不被当成新的一轮',
+    obs: observe({ taskPoints: [video('v1', false)], media: null }),
+    mem: () => memory({ resume: ladder({ attempts: 3, dueAt: NOW - 5000 }) }),
+    expect: { kind: A.OPEN_TASK_POINT },
+    expectMemory: (m) => m.resume && m.resume.attempts === 3,
+  },
+
+  // 第一段用尽 → 重启一次脚本
+  {
+    name: '第一段 5 次用尽 → 倒计时「再等 N 秒仍没恢复就重启脚本」',
+    obs: observe({ media: media({ currentTime: 30, paused: true }) }),
+    mem: () => memory({ resume: ladder({ attempts: C.RESUME_MAX_ATTEMPTS, dueAt: NOW + 2000 }) }),
+    expect: { kind: A.WAIT, pending: P.RESUME_RESTART, pendingDueAt: NOW + 2000 },
+  },
+  {
+    name: '第一段用尽到点 → 重启脚本：重置时间基准、保住推进记忆、进入第二段',
+    obs: observe({ media: media({ currentTime: 30, paused: true }) }),
+    mem: () => memory({
+      resume: ladder({ attempts: C.RESUME_MAX_ATTEMPTS, dueAt: NOW }),
+      unreadySince: NOW - 10000,
+      lastAction: { kind: A.ADVANCE, at: NOW - 1000 },
+      advanceSignature: 'v11',
+    }),
+    // 重启那一刻先再播一次，并把第二段第 1 次排在一个间隔之后
+    expect: { kind: A.AUTO_RESUME, pending: P.AUTO_RESUME_AFTER_RESTART, pendingDueAt: NOW + C.RESUME_INTERVAL_MS },
+    expectMemory: (m) => m.resume.stage === 2 && m.resume.attempts === 0 && m.resume.key === 'mk1' &&
+      m.unreadySince === null &&
+      !!m.lastAction && m.lastAction.kind === A.ADVANCE &&
+      m.advanceSignature === 'v11',
+  },
+
+  // 第二段：重启之后再试 RESTART_MAX_ATTEMPTS 次，然后才真正停下
+  {
+    name: '第二段到点 → 再按一次播放，倒计时报第 k/3 次',
+    obs: observe({ media: media({ currentTime: 30, paused: true }) }),
+    mem: () => memory({ resume: ladder({ stage: 2, attempts: 0, dueAt: NOW }) }),
+    expect: { kind: A.AUTO_RESUME, pending: P.AUTO_RESUME_AFTER_RESTART },
+    expectMemory: (m) => m.resume.stage === 2 && m.resume.attempts === 1,
+  },
+  {
+    name: '第二段 3 次用尽 → 倒计时「再等 N 秒仍没恢复就停下」',
+    obs: observe({ media: media({ currentTime: 30, paused: true }) }),
+    mem: () => memory({ resume: ladder({ stage: 2, attempts: C.RESTART_MAX_ATTEMPTS, dueAt: NOW + 4000 }) }),
+    expect: { kind: A.WAIT, pending: P.RESUME_FINAL, pendingDueAt: NOW + 4000 },
+  },
+  {
+    name: '第二段用尽到点 → 真正停下，原因记为「播放被暂停」',
+    obs: observe({ media: media({ currentTime: 30, paused: true }) }),
+    mem: () => memory({ resume: ladder({ stage: 2, attempts: C.RESTART_MAX_ATTEMPTS, dueAt: NOW }) }),
     expect: { kind: A.STOP, reason: R.MANUAL_PAUSE },
   },
   {
-    name: '恢复播放后暂停计时被清掉',
-    obs: observe({ media: media({ currentTime: 31, paused: false }) }),
-    mem: () => memory({ pausedSince: NOW - C.PAUSE_GRACE_MS }),
-    expect: { kind: A.WAIT },
-    expectMemory: (m) => m.pausedSince === null,
+    name: '第二段用尽到点、此刻仍失焦 → 原因记为「失焦暂停」',
+    obs: observe({ media: media({ currentTime: 30, paused: true }), focus: { lost: true } }),
+    mem: () => memory({ resume: ladder({ stage: 2, attempts: C.RESTART_MAX_ATTEMPTS, dueAt: NOW }) }),
+    expect: { kind: A.STOP, reason: R.FOCUS_LOST_PAUSE },
   },
 
   // ---- 推进与结束 ----

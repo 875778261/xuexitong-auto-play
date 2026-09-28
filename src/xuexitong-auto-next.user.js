@@ -11,7 +11,8 @@
 // ==/UserScript==
 
 // 行为边界见 docs/adr/0002（只做如实完播后的推进）、docs/adr/0005 与 0007（脚本播不了的任务点一律跳过，
-// 平台弹确认框时代为确认）、docs/adr/0006（任务点按 jobid 认；只剩资料附件的节点直接推进，不等也不停）。
+// 平台弹确认框时代为确认）、docs/adr/0006（任务点按 jobid 认；只剩资料附件的节点直接推进，不等也不停）、
+// docs/adr/0009（媒体没在播时不再直接停下：自动续播 5 次 → 重启一次脚本 → 再 3 次，才真正停下）。
 // 设计依据见 .scratch/xuexitong-auto-next/spec.md；层级是「节点 → 卡片 → 任务点」，见 CONTEXT.md。
 //
 // 本文件分三层：
@@ -29,8 +30,9 @@
   const C = {
     TICK_MS: 1000,                    // 采样间隔
     ADVANCE_DELAY_MS: 15000,          // 播完之后固定等这么久再推进（spec 的共识第 3 条）
-    PAUSE_GRACE_MS: 5000,             // 已起播的媒体被暂停后，等这么久才判定为「停下」
-    START_GIVEUP_MS: 6000,            // 已请求过起播却仍停在原地，等这么久就判定被浏览器拒绝
+    RESUME_INTERVAL_MS: 5000,         // 续播阶梯的节奏：每 5 秒一次（也接走了原来的暂停宽限）
+    RESUME_MAX_ATTEMPTS: 5,           // 第一段：重启之前最多续播几次
+    RESTART_MAX_ATTEMPTS: 3,          // 第二段：重启之后最多续播几次
     STALL_TIMEOUT_MS: 20000,          // currentTime 这么久不前进即判定卡住
     UNREADY_TIMEOUT_MS: 30000,        // 页面给不出媒体（或卡片层认不出来），等这么久才放弃
     EMPTY_CARD_GRACE_MS: 3000,        // 本卡片一个任务点都没有时，先按这么久当「还没渲染出来」
@@ -45,6 +47,7 @@
   const ACTION = {
     WAIT: 'wait',
     START: 'start',                   // 调 media.play()
+    AUTO_RESUME: 'autoResume',        // 媒体没在播：再按一次播放（续播阶梯，见 ADR 0009）
     OPEN_TASK_POINT: 'openTaskPoint', // 定位到第一个未完成的可播单元（本卡片内找不到就切下一张卡片）
     ADVANCE: 'advance',               // 点「下一节」
     CONFIRM_ADVANCE: 'confirmAdvance',// 点确认框里的「下一节」
@@ -73,8 +76,10 @@
     ADVANCE_DELAY: 'advanceDelay',       // 媒体播完后的固定延迟
     ADVANCE_COOLDOWN: 'advanceCooldown', // 刚推进过，等同类动作的冷却
     UNREADY: 'unready',                  // 等页面交出可播单元，等不到就停下
-    START_GIVEUP: 'startGiveup',         // 已请求起播，却一直没开始播
-    PAUSED: 'paused',                    // 已起播的媒体被暂停了
+    AUTO_RESUME: 'autoResume',           // 续播阶梯第一段：还有名额，到点就再按一次播放
+    RESUME_RESTART: 'resumeRestart',     // 第一段用尽：等最后一次的结果，没恢复就重启脚本
+    AUTO_RESUME_AFTER_RESTART: 'autoResumeAfterRestart', // 第二段（重启之后）：还有名额
+    RESUME_FINAL: 'resumeFinal',         // 第二段也用尽：等最后一次的结果，没恢复就停下
     STALLED: 'stalled',                  // 在播，但进度不前进
   }
 
@@ -110,12 +115,16 @@
       endedAt: null,           // 当前媒体播完的时刻
       unreadySince: null,      // 页面连续给不出「媒体」（或卡片层认不出来）的起点
       emptyCardSince: null,    // 本卡片连续「一个任务点都没有」的起点
-      pausedSince: null,       // 当前媒体持续处于暂停的起点
       lastAction: null,        // { kind, at } 上次发出的动作
       advanceSignature: null,  // 上次点「下一节」时看到的任务点签名
       startRequestedKey: null, // 已经替哪个媒体请求过起播（spec：起播不重试）
+      // 本轮续播阶梯的账本，见 docs/adr/0009：
+      //   { key, stage, attempts, dueAt, playingSince }
+      //   stage 1 = 第一段（最多 RESUME_MAX_ATTEMPTS 次）；stage 2 = 重启之后（最多 RESTART_MAX_ATTEMPTS 次）
+      //   attempts 到本段上限 = 最后一次已发出、正在等它是否生效；playingSince = 从何时起「连续在播」
+      resume: null,
       scan: null,              // 本轮「找可播单元」的卡片账本：{ total, visited, sawUnfinished }
-      pending: null,           // 当前这次等待：{ kind ∈ PENDING, dueAt }；没有倒计时可报就是 null
+      pending: null,           // 当前这次等待：{ kind ∈ PENDING, dueAt, …文案要拼的数字 }；没有倒计时可报就是 null
     }
   }
 
@@ -130,8 +139,28 @@
 
   // 这一次等待是等什么、等到什么时候 —— 状态条拿它报倒计时。
   // 纯数据，不含文案：文案在状态条那一层（PENDING_TEXT）。
-  function pendingOf(kind, dueAt) {
-    return { kind: kind, dueAt: dueAt }
+  // extra 用来捎带文案要拼的数字（续播阶梯要报「第 k/N 次」）
+  function pendingOf(kind, dueAt, extra) {
+    return Object.assign({ kind: kind, dueAt: dueAt }, extra || null)
+  }
+
+  // 续播阶梯每一段的名额（docs/adr/0009）
+  function resumeMaxOf(stage) {
+    return stage === 1 ? C.RESUME_MAX_ATTEMPTS : C.RESTART_MAX_ATTEMPTS
+  }
+
+  // 阶梯上这一次等待该报哪条倒计时：还有名额 → 动手类（到点再续播一次）；
+  // 名额用尽 → 放弃类（到点就重启脚本 / 就停下）。
+  function resumePending(resume) {
+    const max = resumeMaxOf(resume.stage)
+    if (resume.attempts < max) {
+      return pendingOf(
+        resume.stage === 1 ? PENDING.AUTO_RESUME : PENDING.AUTO_RESUME_AFTER_RESTART,
+        resume.dueAt,
+        { attempt: resume.attempts + 1, max: max }
+      )
+    }
+    return pendingOf(resume.stage === 1 ? PENDING.RESUME_RESTART : PENDING.RESUME_FINAL, resume.dueAt)
   }
 
   // pending 省略 = 这一次等待没有倒计时可报（例如「正在播、什么都不做」）
@@ -286,13 +315,30 @@
     // 页面给出了「媒体」，这个等待窗口就算结束了
     if (media) mem = Object.assign({}, mem, { unreadySince: null })
 
-    // 8. 媒体加载失败
-    if (media && media.failed) return stop(mem, STOP_REASON.MEDIA_LOAD_FAILED)
+    // 8. 续播阶梯的「恢复确认」：媒体回到在播、且**连续在播满一个间隔**才算真的活了（ADR 0009）。
+    //    只用「paused === false」不行：平台的播放器之间有一个 1 秒轮询的「同一时刻只有一个能播」
+    //    守卫，「起了又被按停」会被瞬时判据当成成功 —— 5 次的上限于是悄悄变成无限。
+    //    媒体中途消失（media 为 null）时账本原样留着：那是同一轮故障，不能被当成新的一轮。
+    if (mem.resume && media) {
+      if (!media.failed && !media.paused) {
+        const playingSince = since(mem.resume.playingSince, now)
+        mem = Object.assign({}, mem, {
+          resume: now - playingSince >= C.RESUME_INTERVAL_MS
+            ? null
+            : Object.assign({}, mem.resume, { playingSince: playingSince }),
+        })
+      } else if (mem.resume.playingSince !== null) {
+        mem = Object.assign({}, mem, { resume: Object.assign({}, mem.resume, { playingSince: null }) })
+      }
+    }
 
-    // 9. 播完了：固定等一段，再去找下一个可播单元
+    // 9. 媒体加载失败 → 先走续播阶梯（原先立刻停；网络抖动时 play() 会重跑资源选择，可能救回来）
+    if (media && media.failed) return resumeOrStop(STOP_REASON.MEDIA_LOAD_FAILED)
+
+    // 10. 播完了：固定等一段，再去找下一个可播单元。播完说明这条媒体的事已经结束，阶梯作废
     if (media && media.ended) {
       const endedAt = since(mem.endedAt, now)
-      mem = Object.assign({}, mem, { endedAt })
+      mem = Object.assign({}, mem, { endedAt, resume: null })
       if (now - endedAt < C.ADVANCE_DELAY_MS) {
         return wait(mem, pendingOf(PENDING.ADVANCE_DELAY, endedAt + C.ADVANCE_DELAY_MS))
       }
@@ -300,32 +346,25 @@
     }
     mem = Object.assign({}, mem, { endedAt: null })
 
-    // 10. 暂停分两种，两种都不静默续播（ADR 0002）
+    // 11. 暂停：不再停下等人，交给续播阶梯（ADR 0009）
     if (media && media.paused) {
-      const pausedSince = since(mem.pausedSince, now)
-      mem = Object.assign({}, mem, { pausedSince })
-
-      // 10a. 已经起播过又被暂停：可能失焦，也可能是用户自己点的 —— 停下，等用户发话
-      if (media.currentTime > 0) {
-        if (now - pausedSince >= C.PAUSE_GRACE_MS) {
-          return stop(mem, focus.lost ? STOP_REASON.FOCUS_LOST_PAUSE : STOP_REASON.MANUAL_PAUSE)
-        }
-        return wait(mem, pendingOf(PENDING.PAUSED, pausedSince + C.PAUSE_GRACE_MS))
-      }
-
-      // 10b. 还没起播：替它请求一次起播，同一个媒体只请求一次（spec：不重试、不静音重试）
+      // 11a. 还没起播：替它请求一次起播，同一个媒体只请求一次。**首次请求仍然立刻发**，
+      //      被反转的只是「之后不重试」（那一条现在由阶梯接管）。
       //      起播请求**不走冷却**：同一个媒体只请求一次已由 startRequestedKey 守住；
       //      再叠一层冷却反而会把那次请求吞掉（冷却返回 WAIT 时 key 已经记下，之后不再发）
-      if (mem.startRequestedKey !== media.key) {
+      if (media.currentTime === 0 && mem.startRequestedKey !== media.key) {
         mem = Object.assign({}, mem, { startRequestedKey: media.key })
         return throttledAction(ACTION.START, mem, now, 0)
       }
-      if (now - pausedSince >= C.START_GIVEUP_MS) return stop(mem, STOP_REASON.PLAYBACK_REFUSED)
-      return wait(mem, pendingOf(PENDING.START_GIVEUP, pausedSince + C.START_GIVEUP_MS))
+      // 11b. 其余情形（已起播又被暂停、起播请求过却一直没动）都走阶梯 ——
+      //      原因只在**真正停下**那一刻才用，焦点那时可能已经回来了。
+      //      从没播起来过的一律算「被拒」；确实播过才按焦点分「失焦」与「手动」
+      return resumeOrStop(media.currentTime === 0
+        ? STOP_REASON.PLAYBACK_REFUSED
+        : (focus.lost ? STOP_REASON.FOCUS_LOST_PAUSE : STOP_REASON.MANUAL_PAUSE))
     }
-    mem = Object.assign({}, mem, { pausedSince: null })
 
-    // 11. 卡住：播放中 currentTime 长时间不前进
+    // 12. 卡住：播放中 currentTime 长时间不前进
     let pending = null
     if (media) {
       // 本 tick 的 currentTime 和上次采样一样 = 进度真的没动，这时才报倒计时。
@@ -339,11 +378,56 @@
       mem = Object.assign({}, mem, { lastSample: null })
     }
 
-    // 12. 本卡片还有未完成的可播任务点、媒体也已经在播 —— 什么都不做
+    // 13. 本卡片还有未完成的可播任务点、媒体也已经在播 —— 什么都不做
     if (playable.length > 0 && media) return wait(mem, pending)
 
-    // 13. 该去找下一个可播单元了
+    // 14. 该去找下一个可播单元了
     return locateOrAdvance()
+
+    // 续播阶梯（docs/adr/0009）：「媒体没在播」的几条出口共用这一段 ——
+    // 先按间隔再播几次；第一段用尽就重启一次脚本；第二段也用尽才真正停下。
+    // reason 由调用方给出，只在**停下那一刻**才用到（焦点可能已经回来了）。
+    function resumeOrStop(reason) {
+      const key = media.key
+      let resume = mem.resume
+      if (!resume || resume.key !== key) {
+        // 新的一轮（换了媒体，或头一次发现这条媒体没在播）：第一次尝试排在一个间隔之后
+        resume = { key: key, stage: 1, attempts: 0, dueAt: now + C.RESUME_INTERVAL_MS, playingSince: null }
+        mem = Object.assign({}, mem, { resume: resume })
+        return wait(mem, resumePending(resume))
+      }
+      if (now < resume.dueAt) return wait(mem, resumePending(resume))
+
+      const max = resumeMaxOf(resume.stage)
+      if (resume.attempts < max) {
+        resume = Object.assign({}, resume, {
+          attempts: resume.attempts + 1,
+          dueAt: now + C.RESUME_INTERVAL_MS,
+          playingSince: null,
+        })
+        mem = Object.assign({}, mem, { resume: resume })
+        return {
+          action: { kind: ACTION.AUTO_RESUME },
+          memory: Object.assign({}, mem, { pending: resumePending(resume) }),
+        }
+      }
+
+      // 名额用尽且已到点：第一段 → 重启一次脚本；第二段 → 真正停下
+      if (resume.stage === 1) {
+        // 重启 = 与「继续」按钮同一套口径：重置全部时间基准（重新扫任务点、重新找媒体），
+        // 但**保住推进的记忆**（lastAction / advanceSignature 丢了会重复点「下一节」），
+        // 并记住「已经重启过一次」这件事 —— 否则重启后又获得 5 次，就无限了
+        const fresh = initialMemory()
+        fresh.lastAction = mem.lastAction
+        fresh.advanceSignature = mem.advanceSignature
+        fresh.resume = { key: key, stage: 2, attempts: 0, dueAt: now + C.RESUME_INTERVAL_MS, playingSince: null }
+        return {
+          action: { kind: ACTION.AUTO_RESUME },
+          memory: Object.assign(fresh, { pending: resumePending(fresh.resume) }),
+        }
+      }
+      return stop(mem, reason)
+    }
 
     // 「推进」的全部出口：先在本卡片内定位；本卡片没有可播单元就切到还没找过的卡片；
     // 全部卡片都找过、确实没有可播单元了，才去点「下一节」。
@@ -783,8 +867,15 @@
     if (container) bringIntoView(container)
     const result = el.play()
     if (result && typeof result.catch === 'function') {
-      result.catch(function () { /* 按 spec 不重试，交给决策核心的时限去判定 */ })
+      result.catch(function () { /* 失败不在这里管：交给决策核心的续播阶梯（ADR 0009） */ })
     }
+  }
+
+  // 「继续」按钮与续播阶梯共用同一件事：对当前媒体按一次播放。
+  // 仍然只碰这一个媒体 —— 不改时间轴、不动上报字段（ADR 0002 的边界不动）。
+  function playOnce() {
+    const media = findMedia()
+    if (media && hasUsableSource(media) && media.paused && !media.ended) attemptPlay(media)
   }
 
   // 适配层对外的全部能力。驱动循环只认这几个，自己一行都不碰目标站点的 DOM。
@@ -831,6 +922,9 @@
         case ACTION.START:
           attemptPlay(findMedia())
           return
+        case ACTION.AUTO_RESUME:
+          playOnce()
+          return
         case ACTION.OPEN_TASK_POINT:
           locateNextPlayable(action.card)
           return
@@ -850,11 +944,8 @@
       }
     },
 
-    // 「继续」是人的动作，不是脚本的决策：直接替用户按一次播放
-    playOnce: function () {
-      const media = findMedia()
-      if (media && hasUsableSource(media) && media.paused && !media.ended) attemptPlay(media)
-    },
+    // 「继续」是人的动作，不是脚本的决策：直接替用户按一次播放（与续播阶梯同一个动作）
+    playOnce: playOnce,
   }
 
   // ============================================================
@@ -865,6 +956,10 @@
     return Math.round(ms / 1000)
   }
 
+  // 续播阶梯两段都用尽之后才有的后缀 —— 步数同样由常量拼，不手写数字（docs/adr/0009）
+  const RESUME_EXHAUSTED = '（已自动续播 ' + C.RESUME_MAX_ATTEMPTS + ' 次、重启后 ' +
+    C.RESTART_MAX_ATTEMPTS + ' 次均未成功）'
+
   const REASON_TEXT = {
     userStopped: '你停止了脚本',
     loginRiskControl: '检测到多端登录风控警告，已停下 —— 请只保留一个设备在线',
@@ -873,12 +968,11 @@
       ' 秒也没有，已停下 —— 可能是任务点结构变了，或卡片层认不出来',
     mediaIncompleteConfirm: '平台弹出了「还有任务点未完成」，但脚本还没把本节点的可播任务点找完/播完 —— 判断不可信，脚本不替你确认',
     dialogWithoutUnfinished: '平台弹出「还有任务点未完成」，但脚本扫遍本节点却一个未完成任务点都没看到 —— 判定不可信，已停下',
-    mediaLoadFailed: '视频/音频加载失败，已停下',
-    focusLostPause: '窗口失去焦点后播放被暂停，已停下 —— 请回到窗口后点「继续」',
-    manualPause: '播放被暂停了，已停下 —— 点「继续」接着跑',
+    mediaLoadFailed: '视频/音频加载失败，已停下' + RESUME_EXHAUSTED,
+    focusLostPause: '窗口失去焦点后播放被暂停，已停下 —— 请回到窗口后点「继续」' + RESUME_EXHAUSTED,
+    manualPause: '播放被暂停了，已停下 —— 点「继续」接着跑' + RESUME_EXHAUSTED,
     stalled: '播放卡住了（进度 ' + secs(C.STALL_TIMEOUT_MS) + ' 秒不前进），已停下',
-    playbackRefused: '浏览器拒绝了自动播放（请求起播后 ' + secs(C.START_GIVEUP_MS) +
-      ' 秒仍没动），已停下 —— 请手动点一下播放',
+    playbackRefused: '浏览器拒绝了自动播放，已停下 —— 请手动点一下播放' + RESUME_EXHAUSTED,
     courseCompleted: '没有「下一节」入口了，脚本结束 —— 若后面还有内容，多半是页面结构变了',
     running: '正在运行',
   }
@@ -890,8 +984,14 @@
     [PENDING.ADVANCE_DELAY]: function (s) { return s + ' 秒后继续推进' },
     [PENDING.ADVANCE_COOLDOWN]: function (s) { return s + ' 秒后重试推进' },
     [PENDING.UNREADY]: function (s) { return '再等 ' + s + ' 秒没动静就停下' },
-    [PENDING.START_GIVEUP]: function (s) { return '再等 ' + s + ' 秒仍未开始播放　将判定被拒绝' },
-    [PENDING.PAUSED]: function (s) { return '再等 ' + s + ' 秒仍暂停　将停下' },
+    [PENDING.AUTO_RESUME]: function (s, p) {
+      return s + ' 秒后自动续播（第 ' + p.attempt + '/' + p.max + ' 次）'
+    },
+    [PENDING.RESUME_RESTART]: function (s) { return '再等 ' + s + ' 秒仍没恢复就重启脚本' },
+    [PENDING.AUTO_RESUME_AFTER_RESTART]: function (s, p) {
+      return '脚本已重启　' + s + ' 秒后自动续播（第 ' + p.attempt + '/' + p.max + ' 次）'
+    },
+    [PENDING.RESUME_FINAL]: function (s) { return '再等 ' + s + ' 秒仍没恢复就停下' },
     [PENDING.STALLED]: function (s) { return '再等 ' + s + ' 秒没进度就停下' },
   }
 
@@ -902,7 +1002,8 @@
     const template = PENDING_TEXT[pending.kind]
     if (!template) return ''
     const remain = Math.ceil((pending.dueAt - Date.now()) / 1000)
-    return template(remain > 0 ? remain : 0)
+    // 第二个入参是整条 pending：续播阶梯要拼「第 k/N 次」这类数字
+    return template(remain > 0 ? remain : 0, pending)
   }
 
   function createStatusBar() {
