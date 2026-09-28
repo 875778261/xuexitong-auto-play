@@ -10,7 +10,8 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-// 行为边界见 docs/adr/0002（只做如实完播后的推进）与 docs/adr/0005（PPT 脚本够不到，仅剩 PPT 时代为确认推进）。
+// 行为边界见 docs/adr/0002（只做如实完播后的推进）、docs/adr/0005 与 0007（脚本播不了的任务点一律跳过，
+// 平台弹确认框时代为确认）、docs/adr/0006（任务点按 jobid 认；只剩资料附件的节点直接推进，不等也不停）。
 // 设计依据见 .scratch/xuexitong-auto-next/spec.md；层级是「节点 → 卡片 → 任务点」，见 CONTEXT.md。
 //
 // 本文件分三层：
@@ -31,7 +32,8 @@
     PAUSE_GRACE_MS: 5000,             // 已起播的媒体被暂停后，等这么久才判定为「停下」
     START_GIVEUP_MS: 6000,            // 已请求过起播却仍停在原地，等这么久就判定被浏览器拒绝
     STALL_TIMEOUT_MS: 20000,          // currentTime 这么久不前进即判定卡住
-    UNREADY_TIMEOUT_MS: 30000,        // 页面给不出任务点/媒体，等这么久才放弃
+    UNREADY_TIMEOUT_MS: 30000,        // 页面给不出媒体（或卡片层认不出来），等这么久才放弃
+    EMPTY_CARD_GRACE_MS: 3000,        // 本卡片一个任务点都没有时，先按这么久当「还没渲染出来」
     ACTION_COOLDOWN_MS: 4000,         // 同类动作的最小重复间隔
     ADVANCE_REPEAT_GUARD_MS: 8000,    // 页面没变化时，不重复点「下一节」
     TASK_POINT_CACHE_MS: 3000,        // 任务点元素的重扫间隔
@@ -53,9 +55,7 @@
     USER_STOPPED: 'userStopped',
     LOGIN_RISK_CONTROL: 'loginRiskControl',
     FACE_CAPTURE_COURSE: 'faceCaptureCourse',
-    TASK_POINTS_NOT_FOUND: 'taskPointsNotFound',
     MEDIA_NOT_FOUND: 'mediaNotFound',
-    UNKNOWN_TASK_POINT_KIND: 'unknownTaskPointKind',
     MEDIA_INCOMPLETE_CONFIRM: 'mediaIncompleteConfirm',
     DIALOG_WITHOUT_UNFINISHED: 'dialogWithoutUnfinished',
     MEDIA_LOAD_FAILED: 'mediaLoadFailed',
@@ -96,7 +96,8 @@
     return {
       lastSample: null,        // { at, currentTime } 上次 currentTime 发生变化的时刻
       endedAt: null,           // 当前媒体播完的时刻
-      unreadySince: null,      // 页面连续给不出「任务点 / 媒体」的起点
+      unreadySince: null,      // 页面连续给不出「媒体」（或卡片层认不出来）的起点
+      emptyCardSince: null,    // 本卡片连续「一个任务点都没有」的起点
       pausedSince: null,       // 当前媒体持续处于暂停的起点
       lastAction: null,        // { kind, at } 上次发出的动作
       advanceSignature: null,  // 上次点「下一节」时看到的任务点签名
@@ -148,14 +149,21 @@
     const unchanged = mem.advanceSignature !== null && mem.advanceSignature === signature
     const result = throttledAction(ACTION.ADVANCE, mem, now, unchanged ? C.ADVANCE_REPEAT_GUARD_MS : 0)
     if (result.action.kind === ACTION.WAIT) return result
-    return { action: result.action, memory: Object.assign({}, result.memory, { advanceSignature: signature }) }
+    return {
+      action: result.action,
+      // 页面要翻了，重新开始算「本卡片是空的」—— 别把上一张卡片的计时等到新节点头上
+      memory: Object.assign({}, result.memory, { advanceSignature: signature, emptyCardSince: null }),
+    }
   }
 
   // 「可播单元要跨卡片找」这件事的账本：
   // 一张卡片给出可播单元，搜索就按 spec 写死的顺序从第 1 张卡片重来；
   // 没给出可播单元就把它记下来，记满本节点全部卡片 = 本节点已无可播单元（只剩 PPT）。
   // card.total === 0 表示「卡片层认不出来」（有切换器却没有活动卡片），此时不记也不下结论。
-  function withCardScan(mem, card, cardGaveWork, cardHasUnfinished) {
+  // provisional = 这张卡片还在「一个任务点都没有」的窗口期里：内容可能只是还没渲染出来，
+  // 这一笔不能记（记了就等于「这个节点没什么可做的」，会把它真的跳过）。
+  function withCardScan(mem, card, cardGaveWork, cardHasUnfinished, provisional) {
+    if (provisional) return mem
     if (cardGaveWork || card.total <= 0) return Object.assign({}, mem, { scan: null })
     const previous = mem.scan && mem.scan.total === card.total
       ? mem.scan
@@ -213,26 +221,25 @@
 
     const taskPoints = observation.taskPoints || []
 
-    // 4. 采不到任务点：可能页面还在加载，给它一个窗口期
-    if (taskPoints.length === 0) {
-      const unreadySince = since(mem0.unreadySince, now)
-      const mem = Object.assign({}, mem0, { unreadySince })
-      if (now - unreadySince >= C.UNREADY_TIMEOUT_MS) return stop(mem, STOP_REASON.TASK_POINTS_NOT_FOUND)
-      return wait(mem)
-    }
-
+    // 「要播的」与「脚本播不了的」是两个集合：PPT、以及被判成**认不出类型**的任务点都归后者
+    // （ADR 0005 / 0007）。它们不参与播放，但要参与「本节点还有没有要做的事」这个判断。
     const unfinished = taskPoints.filter((t) => !t.completed)
     const playable = unfinished.filter(isPlayableUnfinished)
-    const unknown = unfinished.filter((t) => !isPlayableUnfinished(t) && t.kind !== KIND.PPT)
 
-    // 5. 认不出的任务点类型：不猜（ADR 0005）
-    if (unknown.length > 0) return stop(mem0, STOP_REASON.UNKNOWN_TASK_POINT_KIND)
+    // 4. 本卡片一个任务点都没有 —— 先当「内容还没渲染出来」，给它一个窗口期。
+    //    窗口期里不记账：记了就等于「这个节点没什么可做的」，会把真任务点也跳过去（ADR 0006）
+    const emptyCardSince = taskPoints.length === 0 ? since(mem0.emptyCardSince, now) : null
+    const emptyCardProvisional = emptyCardSince !== null && now - emptyCardSince < C.EMPTY_CARD_GRACE_MS
 
-    // 6. 卡片账本：可播单元要找遍本节点的全部卡片（DOM 里只有 active 那张的内容）
-    let mem = withCardScan(mem0, card, playable.length > 0, unfinished.length > 0)
+    // 5. 卡片账本：可播单元要找遍本节点的全部卡片（DOM 里只有 active 那张的内容）
+    let mem = withCardScan(mem0, card, playable.length > 0, unfinished.length > 0, emptyCardProvisional)
+    mem = Object.assign({}, mem, { emptyCardSince })
     const scannedAll = scanCoversNode(mem, card)
 
-    // 7. 未完成确认框（ADR 0002 / 0005）：只有「全部卡片扫遍、未完成的只剩 PPT」才替用户点确认
+    // 6. 未完成确认框（ADR 0002 / 0005 / 0007）：扫遍全部卡片、未完成的全是**脚本播不了的**
+    //    （PPT 或认不出类型），才替用户点确认。
+    //    ⚠️ 这一步必须排在「本卡片空就推进」前面：平台说还有没做的、脚本却一个未完成都没看见时，
+    //    这里是唯一会停下来的地方（ADR 0006 的安全网就是这张确认框，不是脚本自己造的判据）
     if (page.confirmDialogVisible) {
       if (scannedAll && playable.length === 0) {
         // 扫遍了却一个未完成任务点都没看到，平台却弹了确认框 —— 两边有一边错了，停下让人看
@@ -241,6 +248,11 @@
       }
       return stop(mem, STOP_REASON.MEDIA_INCOMPLETE_CONFIRM)
     }
+
+    // 7. 本卡片是空的：窗口期内先等；窗口期过了就照卡片账本办 ——
+    //    没扫遍本节点的其他卡片就去扫，扫遍了就推进（ADR 0006：只剩资料附件的节点直接推进）
+    if (emptyCardProvisional) return wait(mem)
+    if (taskPoints.length === 0) return locateOrAdvance()
 
     const media = observation.media || null
 
@@ -312,7 +324,8 @@
     // 一直等不到就停下，别在这儿硬撑
     function waitForPlayable(extra) {
       const unreadySince = since(mem.unreadySince, now)
-      mem = Object.assign({}, mem, { unreadySince })
+      // 要切卡片了：页面马上要换一张，重新开始算「本卡片是空的」
+      mem = Object.assign({}, mem, { unreadySince, emptyCardSince: null })
       if (now - unreadySince >= C.UNREADY_TIMEOUT_MS) return stop(mem, STOP_REASON.MEDIA_NOT_FOUND)
       return throttledAction(ACTION.OPEN_TASK_POINT, mem, now, undefined, extra)
     }
@@ -402,24 +415,25 @@
     return ADAPTER_FACTS.moduleKindMap[matched[1]] || KIND.UNKNOWN
   }
 
-  // 模块 iframe 上的 jobid 属性是任务点的稳定标识；PPT 有时只写在 data 里
-  function taskPointId(el, index) {
+  // 任务点的唯一判据：jobid。模块 iframe 的属性上有，或者 data JSON 里有（PPT 的只写在 data 里）。
+  // 两处都读不到就**不是任务点** —— 平台把资料附件（/ananas/modules/downloadfile/）渲染进同一个
+  // .ans-attach-ct 容器里，它没有 jobid、不计入 jobUnfinishCount、也不会拦住「下一节」（ADR 0006）。
+  function jobIdOf(el) {
     const module = el.querySelector(ADAPTER_FACTS.moduleFrame)
-    let jobid = module ? module.getAttribute('jobid') : ''
-    if (!jobid && module) {
-      try {
-        const data = JSON.parse(module.getAttribute('data') || '{}')
-        jobid = data.jobid || data._jobid || ''
-      } catch (e) {
-        jobid = ''
-      }
+    if (!module) return ''
+    const direct = module.getAttribute('jobid')
+    if (direct) return direct
+    try {
+      const data = JSON.parse(module.getAttribute('data') || '{}')
+      return data.jobid || data._jobid || ''
+    } catch (e) {
+      return ''
     }
-    return jobid || classifyTaskPoint(el) + '#' + index
   }
 
   let taskPointCache = { at: 0, items: [] }
 
-  // 任务点 = 卡片文档里的 .ans-attach-ct 容器，**不**按文案或 icon 找：
+  // 任务点 = 卡片文档里**带 jobid** 的 .ans-attach-ct 容器，**不**按文案或 icon 找：
   // 已完成的任务点没有「已完成」文案，ans-job-icon 也可能整个不存在。
   function scanTaskPoints() {
     const found = []
@@ -436,14 +450,18 @@
     const containers = found.filter(function (el) {
       return !found.some(function (other) { return other !== el && other.contains(el) })
     })
-    return containers.map(function (el, index) {
-      return {
-        id: taskPointId(el, index),
+    const items = []
+    containers.forEach(function (el) {
+      const id = jobIdOf(el)
+      if (!id) return // 资料附件，或模块 iframe 还没渲染出来 —— 都不是任务点
+      items.push({
+        id: id,
         kind: classifyTaskPoint(el),
         completed: el.classList.contains(ADAPTER_FACTS.jobFinishedClass),
         el: el,
-      }
+      })
     })
+    return items
   }
 
   function currentTaskPoints() {
@@ -747,7 +765,7 @@
       const card = observeCard()
       const parts = []
       if (points.length === 0) {
-        parts.push('任务点：尚未采到')
+        parts.push('本卡片无任务点')
       } else {
         const done = points.filter(function (t) { return t.completed }).length
         parts.push('本卡片 ' + done + '/' + points.length)
@@ -800,9 +818,7 @@
     userStopped: '你停止了脚本',
     loginRiskControl: '检测到多端登录风控警告，已停下 —— 请只保留一个设备在线',
     faceCaptureCourse: '这门课启用了人脸抓拍，脚本无法自动化，已放弃',
-    taskPointsNotFound: '一直没找到任务点，可能不是学习页面，或页面结构变了',
     mediaNotFound: '一直没找到可播的视频/音频元素，已停下 —— 可能是任务点结构变了，或卡片层认不出来',
-    unknownTaskPointKind: '有个未完成任务点的模块类型认不出来（不是视频/音频/PPT），已停下 —— 不猜着处理',
     mediaIncompleteConfirm: '平台弹出了「还有任务点未完成」，但脚本还没把本节点的可播任务点找完/播完 —— 判断不可信，脚本不替你确认',
     dialogWithoutUnfinished: '平台弹出「还有任务点未完成」，但脚本扫遍本节点却一个未完成任务点都没看到 —— 判定不可信，已停下',
     mediaLoadFailed: '视频加载失败，已停下',

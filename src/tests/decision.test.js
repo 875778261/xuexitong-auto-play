@@ -79,32 +79,71 @@ const CASES = [
     expect: { kind: A.STOP, reason: R.FACE_CAPTURE_COURSE },
   },
 
-  // ---- 页面还没给出任务点 ----
+  // ---- 本卡片一个任务点都没有（只剩资料附件的节点，ADR 0006）----
   {
-    name: '采不到任务点 → 先等，并开始计时',
+    name: '本卡片没有任务点 → 先等窗口期，并开始计时',
     obs: observe({ taskPoints: [] }),
     expect: { kind: A.WAIT },
-    expectMemory: (m) => m.unreadySince === NOW,
+    expectMemory: (m) => m.emptyCardSince === NOW,
   },
   {
-    name: '采不到任务点超过时限 → 停下',
+    name: '本卡片没有任务点、窗口期内 → 继续等，不重置计时',
     obs: observe({ taskPoints: [] }),
-    mem: () => memory({ unreadySince: NOW - C.UNREADY_TIMEOUT_MS }),
-    expect: { kind: A.STOP, reason: R.TASK_POINTS_NOT_FOUND },
-  },
-  {
-    name: '采不到任务点但在时限内 → 继续等，不重置计时',
-    obs: observe({ taskPoints: [] }),
-    mem: () => memory({ unreadySince: NOW - C.UNREADY_TIMEOUT_MS + 1 }),
+    mem: () => memory({ emptyCardSince: NOW - C.EMPTY_CARD_GRACE_MS + 1 }),
     expect: { kind: A.WAIT },
-    expectMemory: (m) => m.unreadySince === NOW - C.UNREADY_TIMEOUT_MS + 1,
+    expectMemory: (m) => m.emptyCardSince === NOW - C.EMPTY_CARD_GRACE_MS + 1,
+  },
+  {
+    name: '本卡片没有任务点、窗口期内 → 不把这笔记进卡片账本',
+    obs: observe({ taskPoints: [], card: { active: 1, total: 2 } }),
+    expect: { kind: A.WAIT },
+    expectMemory: (m) => m.scan === null,
+  },
+  {
+    name: '本卡片没有任务点、窗口期过了、本节点只有这一张卡片 → 推进（资料展示节点）',
+    obs: observe({ taskPoints: [] }),
+    mem: () => memory({ emptyCardSince: NOW - C.EMPTY_CARD_GRACE_MS }),
+    expect: { kind: A.ADVANCE },
+  },
+  {
+    name: '本卡片没有任务点、窗口期过了、还有没扫过的卡片 → 切过去，不推进',
+    obs: observe({ taskPoints: [], card: { active: 1, total: 2 } }),
+    mem: () => memory({ emptyCardSince: NOW - C.EMPTY_CARD_GRACE_MS }),
+    expect: { kind: A.OPEN_TASK_POINT, card: 2 },
+  },
+  {
+    name: '本卡片没有任务点、窗口期过了、卡片已扫遍 → 推进',
+    obs: observe({ taskPoints: [], card: { active: 2, total: 2 } }),
+    mem: () => memory({
+      emptyCardSince: NOW - C.EMPTY_CARD_GRACE_MS,
+      scan: { total: 2, visited: [1], sawUnfinished: false },
+    }),
+    expect: { kind: A.ADVANCE },
+  },
+  {
+    name: '本卡片没有任务点却在弹确认框 → 停下（判定必须排在「空卡片就推进」之前）',
+    obs: observe({ taskPoints: [], page: page({ confirmDialogVisible: true }) }),
+    expect: { kind: A.STOP, reason: R.DIALOG_WITHOUT_UNFINISHED },
   },
 
-  // ---- 认不出的任务点类型（ADR 0005：不猜，停下） ----
+  // ---- 认不出的任务点类型（ADR 0007：与 PPT 同档 —— 脚本播不了，跳过）----
   {
-    name: '有未完成的任务点认不出类型 → 停下',
+    name: '只剩未完成的认不出类型、本节点只有一张卡片 → 推进',
     obs: observe({ taskPoints: [{ id: 'u1', kind: 'unknown', completed: false }] }),
-    expect: { kind: A.STOP, reason: R.UNKNOWN_TASK_POINT_KIND },
+    expect: { kind: A.ADVANCE },
+  },
+  {
+    name: '只剩未完成的认不出类型、平台弹了确认框 → 代为确认推进',
+    obs: observe({
+      taskPoints: [{ id: 'u1', kind: 'unknown', completed: false }],
+      page: page({ confirmDialogVisible: true }),
+    }),
+    expect: { kind: A.CONFIRM_ADVANCE },
+  },
+  {
+    name: '认不出类型 + 还有没播完的视频 → 先播视频，不跳过',
+    obs: observe({ taskPoints: [{ id: 'u1', kind: 'unknown', completed: false }, video('v1', false)] }),
+    expect: { kind: A.OPEN_TASK_POINT },
   },
   {
     name: '已完成的任务点认不出类型 → 不拦路',

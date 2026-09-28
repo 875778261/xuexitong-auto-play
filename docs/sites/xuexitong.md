@@ -12,6 +12,8 @@
 | `mooc1.xuexitong.com` | **学习页面与播放器**——油猴脚本主要打这一层 |
 | `mobilelearn.` / `stat2-ans.` / `robot-lc.` / `noteyd.` | 活动、统计、数字人、笔记等辅助接口 |
 
+- **找目录（章节树）的必经路径**：课程页 `mooc2-ans/mycourse/stu?courseid=…&clazzid=…&cpi=…` 打开后默认落在**「任务」**页，**章节树要点一下「章节」标签才会渲染**；而且它在一个**跨域 iframe** 里，主文档的 `contentDocument` 读不到——得用 Playwright 的 `page.frames()` 逐帧读。节点名与「未完成数」都在那一帧里。
+
 ## 学习页面的层级
 
 `mooc1.xuexitong.com/mycourse/studentstudy?chapterId=…`
@@ -38,7 +40,8 @@
 
 - 任务点挂在**卡片**下（见上节）。**一张卡片会把它全部任务点一次渲染出来**（实测同一张卡片里十几个任务点同时在 DOM 里），不是懒加载。
 - **扫描入口只能是容器 `div.ans-attach-ct` 本身**：容器里那块 `div.ans-job-icon` 可能只是个空 div、也可能整个不存在（实测 PPT 卡里就有一个容器两者都没有，`jobid` 也不在 iframe 属性上、只写在 iframe 的 `data` JSON 里）。
-- 章节树节点上的 `input.jobUnfinishCount` 是**整节点跨全部卡片**的未完成数，可以直接当「本节点还剩几个」用——它**随完成实时变化**（实测：某个任务点播完被判定完成时，这个数当场减一）。当前节点的那个：`div.posCatalog_active input.jobUnfinishCount`（`type=hidden`）。
+- **容器 ≠ 任务点**：平台把**资料附件**也塞进同样的 `div.ans-attach-ct` 里。区分的唯一可靠判据是 **`jobid`**——任务点的 `jobid` 写在模块 iframe 的属性上（PPT 的在 `data` JSON 里），**资料附件两处都没有**。实测节点「1.1 音标教学PPT」只有一个容器、里面是 `downloadfile` 模块的 `音标.ppt` 附件，被当成任务点后脚本直接停在 `unknownTaskPointKind`。
+- 章节树节点上的 `input.jobUnfinishCount` 是**整节点跨全部卡片**的未完成数，可以直接当「本节点还剩几个」用——它**随完成实时变化**（实测：某个任务点播完被判定完成时，这个数当场减一）。当前节点的那个：`div.posCatalog_active input.jobUnfinishCount`（`type=hidden`）。⚠️ 它**只在未完成数 > 0 时才渲染**：节点没有未完成任务点时页面上根本查不到这个元素（读出来是 `null`，不是 `0`）。
 - 任务点的完成态只有一个可靠标记：容器 `div.ans-attach-ct` 上的 **`ans-job-finished`** 类。
 - `div.ans-job-icon`（`role="option"`）只能当**「这是个任务点」的识别位**，**既不是完成判据、也不是类型判据**：未完成时它带 `aria-label="任务点未完成"`，已完成时它可能是个空 div 也可能整个不存在，两种情况都实测过。
 - **任务点的类型只能从它内部的模块 iframe 的 `src` 读**。`ans-job-icon` 的类名靠不住——视频是 `ans-job-icon ans-job-video ans-job-icon-clear`，**音频与 PPT 都是空的 `ans-job-icon `**：
@@ -48,6 +51,7 @@
   | 视频 | `/ananas/modules/video/index.html` | 容器带 `videoContainer` 类 |
   | 音频 | `/ananas/modules/audio/index_new.html` | 容器 `aria-label` 是文件名（形如 `Unit05R1Word.mp3`） |
   | PPT | `/ananas/modules/pdf/index.html` | iframe 上直接带 `jobid`；`data` 里 `name` 形如 `Unit 5.ppt` |
+  | **资料附件**（**不是任务点**） | `/ananas/modules/downloadfile/index-pc.html` | iframe 上明写 `module="downloadfile"` 与 `class="downloadfile"`；**没有 `jobid`**；`data` 只有 `objectid / name / type / size / hsize / mid`，`name` 形如 `音标.ppt`、`英语语法看这本就够了大全集.pdf` |
 
 - 视频任务点的完成条件是观看时长，**不同节点标示的比例不一致**：同一门课里见过 **90%** 与 **100%** 两种。
 - **PPT 任务点没有 `currentTime`**。它的完成条件是**把内容拉到最底端**：滚到底会触发一次
@@ -83,6 +87,7 @@ GET mooc1.xuexitong.com/mooc-ans/multimedia/log/a/{personid}/{sessionhash}
 ```
 
 - **`isdrag` 是平台判定"你是否拖动过进度条"的字段**——脚本绝不能靠改 `currentTime` 来推进。
+  ⚠️ **它的取值映射没搞清楚，先别当判据用**：已知取值域是 `0|1|2|3`，但实测脚本只调过 `play()`、全程没碰 `currentTime`，上报出来的仍是 **`isdrag=3`**（2026-09-28，节点「2.3 四级解题技巧视频精讲」第一个视频，`playingTime=59&duration=1378`）。所以 3 很可能表示「没拖」，也可能另有含义——**未确认**，别拿它反推行为。
 - `videoFaceCaptureEnc` 说明**部分课程启用人脸抓拍**，那类课程无法自动化。
 - 视频文件本体在 `s2.cldisk.com` / `p2.cldisk.com`（跨域 CDN），但只影响媒体资源，不影响 DOM 操作。
 
@@ -92,7 +97,8 @@ GET mooc1.xuexitong.com/mooc-ans/multimedia/log/a/{personid}/{sessionhash}
 - **当前节点还有未完成任务点时，点击会弹确认框**：「当前章节还有任务点未完成，是否去完成？[下一节][去学习]」——平台在明确劝阻跳过。
 - 确认框是**常驻在 HTML 里、靠 `display:none` 隐藏**的两个弹层：`div.maskDiv.jobFinishTip > div.popDiv.wid440.popMove > p.popWord2.fs16.colorIn.jobLimitTip`，以及 `div#jobFinishTip.AlertCon02 > div.con03`。判「有没有弹出来」不能看 `visibility` / `opacity`，只能看**尺寸是否为 0**（隐藏时两者都是 `0×0`）。
 - 在未完成状态下，直接调用 `PCount.next(...)` **不产生任何跳转**（页面、URL、`window` 状态全不变）。
-- ⚠️ **跳转是一次整页重载还是 SPA 局部刷新，尚未确认**——只有"节点内任务点全部完成"后才测得出来。因此脚本按**幂等**设计：每次就绪都重新"找第一个未完成任务点"，不依赖跨页保存的进度。这样两种情形都成立。
+- **拦不拦只看 `checkJob()`**：`PCount.next(count, chapterId, courseId, clazzid, knowledgestr, checkType)` 的源码里，`checkType && !courseEnded && checkJob()` 为真才 `showCheckDiv(true)` 弹确认框并 `return`，否则往下走真正的跳转。实测在 `1.1 音标教学PPT`、`2.1.2 《……够了》系列电子书`、`2.1.1 词根词缀背单词`（都只有资料附件或空内容）上推进，**一次确认框都没弹**。
+- **跳转已确认是局部刷新，不是整页重载**：主文档不重载，只换 URL 与卡片内容（实测：状态条上停住的旧判定连续跨三次换节都没被重置，`performance.now()` 显示文档已开了 96 秒）。⚠️ 推论很重要——**脚本实例跨节点存活**，它一旦在某个节点停下，从这里往后的所有节点都不会再被它管，除非用户点「继续」。
 
 ## 防挂机机制
 
