@@ -78,3 +78,9 @@ playwright-cli -s=xuexitong eval "location.href"   # 先确认停在目标学习
 - 不做 PPT 的滚动 / 播放，也不给脚本加 `pan-yz.chaoxing.com` 的 `@match`（ADR 0005 的 Considered Options 里记了为什么不划算）。
 - 不动 `decide()` 之外的纯函数形状，不改三层边界。
 - 不引入 `package.json`、打包器或任何测试运行器。
+
+## Comments
+
+2026-09-28：**已实现**，commit `9c6efcb`（用例 49 条全绿，适配层在真实页面上过了验收清单）。与工单的四处偏差、两轴评审后的四处修正都写在 `spec.md` 的 `## Comments` 第三轮里。本文件的 `Status` 保持 `ready-for-agent` 没改——五个 triage 角色里没有「已完成」这一档（见 `docs/agents/triage-labels.md`）。
+
+两条真实页面上**还没被触发**过的路径：「本卡片没有可播单元 → 切下一张卡片」、「只剩 PPT 时 `confirmAdvance`」。要跑到它们得先把某个节点的媒体全播完，目前只有单测覆盖。
