@@ -27,16 +27,18 @@
 ```
 
 - **一个节点（chapter）下有多张「卡片」**（`li#dctN`，带 `title` 标签与 `cardid`），**同一时刻只有 `active` 那张的内容被渲染进 `iframe`**——另外几张在 DOM 里根本不存在。所以「在页面上扫任务点」永远只能扫到**当前卡片**的任务点，而章节树给的「N 个待完成任务点」是**整节点**的数。
-- **卡片标签（视频 / PPT / 音频 / 语法 …）只是标签，不约束组内内容**——任何一张卡片里都可能同时有视频、音频与 PPT。不要按标签决定怎么处理。
-- 切卡片只重渲染 `iframe`，**不会**触发「还有任务点未完成」确认框。
+- **卡片标签（视频 / PPT / 音频 / 语法 …）只是标签，不约束组内内容**——任何一张卡片里都可能同时有视频、音频与 PPT，**不要按标签决定怎么处理**。实测：标签写着「语法」的卡片，装的是视频。
+- 卡片切换器在**主文档**里：`ul.prev_ul > li#dctN`（带 `title` 标签、`cardid`），**活动那张带 `active` 类**，其余几张带 `c<序号>` 类——判断「当前是哪张卡片」只认 `active`。切换靠点 `li` 自己（`onclick="changeDisplayContent(<序号>,…)"`）。
+- 切卡片只重渲染 `iframe`，**不会**触发「还有任务点未完成」确认框。但重渲染会让**所有缓存的元素引用失效**，脚本必须重查。
 - 播放器 iframe 与主页面**同源**（都在 `mooc1.xuexitong.com`），不必跨域通信。
 - 但**任务点内容全在 iframe 里**，只读主页面 DOM 会一无所获。
 - ⚠️ 当前卡片文档里固定有一个 `<audio id="auditionAudio" src="" style="display:none">`（AI 试听），**它不是任务点**——按「页面上第一个 `<audio>`」取媒体会取到它。
 
 ## 任务点与完成判定
 
-- 任务点挂在**卡片**下（见上节）。**一张卡片会把它全部任务点一次渲染出来**（实测音频卡 11 个、视频卡 2 个、PPT 卡 1 个），不是懒加载。
-- 章节树节点上的 `input.jobUnfinishCount` 是**整节点跨全部卡片**的未完成数——实测 2（视频）+ 11（音频）= 13，与节点计数完全吻合，可以直接当「本节点还剩几个」用。
+- 任务点挂在**卡片**下（见上节）。**一张卡片会把它全部任务点一次渲染出来**（实测同一张卡片里十几个任务点同时在 DOM 里），不是懒加载。
+- **扫描入口只能是容器 `div.ans-attach-ct` 本身**：容器里那块 `div.ans-job-icon` 可能只是个空 div、也可能整个不存在（实测 PPT 卡里就有一个容器两者都没有，`jobid` 也不在 iframe 属性上、只写在 iframe 的 `data` JSON 里）。
+- 章节树节点上的 `input.jobUnfinishCount` 是**整节点跨全部卡片**的未完成数，可以直接当「本节点还剩几个」用——它**随完成实时变化**（实测：某个任务点播完被判定完成时，这个数当场减一）。当前节点的那个：`div.posCatalog_active input.jobUnfinishCount`（`type=hidden`）。
 - 任务点的完成态只有一个可靠标记：容器 `div.ans-attach-ct` 上的 **`ans-job-finished`** 类。
 - `div.ans-job-icon`（`role="option"`）只能当**「这是个任务点」的识别位**，**既不是完成判据、也不是类型判据**：未完成时它带 `aria-label="任务点未完成"`，已完成时它可能是个空 div 也可能整个不存在，两种情况都实测过。
 - **任务点的类型只能从它内部的模块 iframe 的 `src` 读**。`ans-job-icon` 的类名靠不住——视频是 `ans-job-icon ans-job-video ans-job-icon-clear`，**音频与 PPT 都是空的 `ans-job-icon `**：
@@ -57,11 +59,18 @@
 - `job/document` 的调用方**不在任何同源脚本里**（枚举 25 个同源 `script[src]` 全部无命中），触发逻辑要么在外链 bundle、要么就在那个跨域页里。
 - 模块里常驻一段隐藏的错误模板：`div#note > p.tipStyle`「文档转码失败，请使用其他软件另存后重新上传【9005】」，`display:none`；文档加载不出来时才会显示。
 - 这个跨域查看器**不总是能加载**：本次探查里 `pan-yz.chaoxing.com` 那次带签名的请求是 `net::ERR_FAILED`，`#panView.contentDocument` 始终为 `null`，页面上也就没有任何逐页内容可滚。**排查 PPT 时的第一步应该是先确认它到底加载起来没有。**
-- 每个视频任务点一个独立 `<video>`，`preload="none"`、`autoplay=false`、`muted=false`，所以**时长必须等 `play()` 之后才拿得到**（起播前 `duration` 为 `null`）。
+- 每个任务点有自己的播放器 iframe 与媒体元素，而且**同一张卡片里的媒体元素是一次性全渲染出来的**（实测同一张卡片里十几个 `<video>`/`<audio>` 同时在 DOM 里）。视频：`preload="none"`、`autoplay=false`、`muted=false`，所以**时长必须等 `play()` 之后才拿得到**（起播前 `duration` 为 `null`）。音频：每个任务点一个真播放器 `audio#audio_html5_api`，外加一个空的 `audio1_html5_white`。
+- ⚠️ **媒体元素的 `id` 在各 iframe 里重名**（全都叫 `video_html5_api` / `audio_html5_api`），**不能当「这是同一个媒体」的稳定标识**——同一张卡片里的播放器 id 完全一样。
+- ⚠️ **`networkState === 3`（NETWORK_NO_SOURCE）不等于加载失败**：`preload="none"` 的播放器在还没开始加载时就是这个值，而 `error` 仍是 `null`（实测切卡片后新渲染出来的媒体全是这个状态）。判加载失败只能看 `error`。
+- ⚠️ 那个 `auditionAudio` 因为 `src=""` **天生带 `error.code=4`**（SRC_NOT_SUPPORTED），同样不能据此判「媒体坏了」。
 
 ## 播放与上报
 
 **零点击自动播放可行。** 该域已有用户交互记录，Chrome 的域级 autoplay 授权放行有声播放，实测直接 `video.play()` 成功（`muted:false`）——**不需要静默降级**。
+
+**而且不需要先「选中/打开」任务点**：直接对目标媒体 `play()` 就会播、模块自己会上报（实测：不点任何入口起播后，`multimedia/log` 照发）。反过来，点任务点容器里的 `div.ans-job-icon` **没有任何可观察效果**（DOM 无变化、也不起播）——它不是播放开关。
+
+上报节奏实测**约每 60 秒一次**（同一段视频看到 `playingTime=59 / 62 / 87 …`）。
 
 播放期间按已看时长增量反复调用上报接口：
 
@@ -94,5 +103,5 @@ GET mooc1.xuexitong.com/mooc-ans/multimedia/log/a/{personid}/{sessionhash}
 
 ## 使用约束（重要）
 
-- **多端登录会被判定异常学习**：同一账号在两个浏览器/设备上同时进入章节页面，平台会弹警告**并登出其中一个会话**（实测发生在本仓库的 Chrome 探查会话与用户日常 Edge 之间）。
+- **多端登录会被判定异常学习**：同一账号在两个浏览器/设备上同时进入章节页面，平台会弹警告**并登出其中一个会话**（实测发生在本仓库的 Chrome 探查会话与用户日常 Edge 之间）。⚠️ **同一个浏览器里同时开两个章节页也算**（实测：新开一个标签页后，先开的那个标签页被跳到 `detect.xuexitong.com` 的警告页）。探查时只留一个章节标签页。
 - 平台风控是活跃的，且 `isdrag`、`videoFaceCaptureEnc` 都指向同一个目标：**防伪造观看**。

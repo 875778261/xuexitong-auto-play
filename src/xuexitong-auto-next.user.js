@@ -10,8 +10,8 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-// 行为边界见 docs/adr/0002（只做如实完播后的推进）与 docs/adr/0003（PPT 不计入需完成范围）。
-// 设计依据见 .scratch/xuexitong-auto-next/spec.md。
+// 行为边界见 docs/adr/0002（只做如实完播后的推进）与 docs/adr/0005（PPT 脚本够不到，仅剩 PPT 时代为确认推进）。
+// 设计依据见 .scratch/xuexitong-auto-next/spec.md；层级是「节点 → 卡片 → 任务点」，见 CONTEXT.md。
 //
 // 本文件分三层：
 //   决策核心（纯函数） → 站点适配层 → 驱动循环（副作用）
@@ -43,7 +43,7 @@
   const ACTION = {
     WAIT: 'wait',
     START: 'start',                   // 调 media.play()
-    OPEN_TASK_POINT: 'openTaskPoint', // 打开第一个可播的未完成任务点
+    OPEN_TASK_POINT: 'openTaskPoint', // 定位到第一个未完成的可播单元（本卡片内找不到就切下一张卡片）
     ADVANCE: 'advance',               // 点「下一节」
     CONFIRM_ADVANCE: 'confirmAdvance',// 点确认框里的「下一节」
     STOP: 'stop',
@@ -55,6 +55,7 @@
     FACE_CAPTURE_COURSE: 'faceCaptureCourse',
     TASK_POINTS_NOT_FOUND: 'taskPointsNotFound',
     MEDIA_NOT_FOUND: 'mediaNotFound',
+    UNKNOWN_TASK_POINT_KIND: 'unknownTaskPointKind',
     MEDIA_INCOMPLETE_CONFIRM: 'mediaIncompleteConfirm',
     DIALOG_WITHOUT_UNFINISHED: 'dialogWithoutUnfinished',
     MEDIA_LOAD_FAILED: 'mediaLoadFailed',
@@ -65,7 +66,7 @@
     COURSE_COMPLETED: 'courseCompleted',
   }
 
-  const KIND = { VIDEO: 'video', AUDIO: 'audio', PPT: 'ppt' }
+  const KIND = { VIDEO: 'video', AUDIO: 'audio', PPT: 'ppt', UNKNOWN: 'unknown' }
 
   // ============================================================
   // 决策核心（纯函数 · 测试缝）
@@ -82,7 +83,8 @@
   //       riskControlWarning: boolean    多端登录风控警告
   //       faceCaptureRequired: boolean   该课程是否启用人脸抓拍
   //     }
-  //     taskPoints: [{ id, kind, completed }]  当前节点内的任务点，按页面顺序
+  //     card: { active, total }        当前节点渲染的是第几张卡片、共几张（只有 active 那张的内容在 DOM 里）
+  //     taskPoints: [{ id, kind, completed }]  **当前卡片**的任务点，按页面顺序；kind ∈ KIND
   //     media: null | { key, currentTime, paused, ended, failed }
   //       key —— 这一个媒体元素的稳定标识，用来判断「起播是否已经请求过」
   //   }
@@ -99,6 +101,7 @@
       lastAction: null,        // { kind, at } 上次发出的动作
       advanceSignature: null,  // 上次点「下一节」时看到的任务点签名
       startRequestedKey: null, // 已经替哪个媒体请求过起播（spec：起播不重试）
+      scan: null,              // 本轮「找可播单元」的卡片账本：{ total, visited, sawUnfinished }
     }
   }
 
@@ -120,11 +123,19 @@
   }
 
   // 同类动作在冷却期内不重复发出 —— 让「点一下」不会变成「点很多下」
-  function throttledAction(kind, mem, now, guardMs) {
+  function throttledAction(kind, mem, now, guardMs, extra) {
     const window = guardMs === undefined ? C.ACTION_COOLDOWN_MS : guardMs
     const last = mem.lastAction
     if (last && last.kind === kind && now - last.at < window) return wait(mem)
-    return { action: { kind }, memory: Object.assign({}, mem, { lastAction: { kind, at: now } }) }
+    return {
+      action: Object.assign({ kind }, extra || null),
+      memory: Object.assign({}, mem, { lastAction: { kind, at: now } }),
+    }
+  }
+
+  // 「可播的未完成任务点」—— 决策核心与适配层共用同一个判据，别各写一份
+  function isPlayableUnfinished(t) {
+    return !t.completed && (t.kind === KIND.VIDEO || t.kind === KIND.AUDIO)
   }
 
   // 任务点签名：用来区分「点了没反应」和「已经翻到别处了」
@@ -140,11 +151,58 @@
     return { action: result.action, memory: Object.assign({}, result.memory, { advanceSignature: signature }) }
   }
 
+  // 「可播单元要跨卡片找」这件事的账本：
+  // 一张卡片给出可播单元，搜索就按 spec 写死的顺序从第 1 张卡片重来；
+  // 没给出可播单元就把它记下来，记满本节点全部卡片 = 本节点已无可播单元（只剩 PPT）。
+  // card.total === 0 表示「卡片层认不出来」（有切换器却没有活动卡片），此时不记也不下结论。
+  function withCardScan(mem, card, cardGaveWork, cardHasUnfinished) {
+    if (cardGaveWork || card.total <= 0) return Object.assign({}, mem, { scan: null })
+    const previous = mem.scan && mem.scan.total === card.total
+      ? mem.scan
+      : { total: card.total, visited: [], sawUnfinished: false }
+    const visited = previous.visited.indexOf(card.active) >= 0
+      ? previous.visited
+      : previous.visited.concat(card.active)
+    return Object.assign({}, mem, {
+      scan: {
+        total: card.total,
+        visited: visited,
+        sawUnfinished: previous.sawUnfinished || cardHasUnfinished,
+      },
+    })
+  }
+
+  // 本节点的全部卡片是否都看过了。
+  // 只有一张卡片时，当前这张就是全部；卡片层认不出来时一律算「没看遍」——宁可停下也不跳。
+  function scanCoversNode(mem, card) {
+    if (card.total === 0) return false
+    if (card.total <= 1) return true
+    const scan = mem.scan
+    if (!scan || scan.total !== card.total) return false
+    for (let i = 1; i <= card.total; i++) {
+      if (scan.visited.indexOf(i) < 0) return false
+    }
+    return true
+  }
+
+  // spec 写死的查找顺序：从第 1 张卡片起。切卡片就切到「还没找过的卡片里序号最小的那张」。
+  // 返回 null = 别切（卡片层认不出来时宁可原地等超时停下，也不瞎点）。
+  function nextCardToVisit(mem, card) {
+    if (card.total <= 0) return null
+    const scan = mem.scan
+    if (!scan || scan.total !== card.total) return 1
+    for (let i = 1; i <= card.total; i++) {
+      if (scan.visited.indexOf(i) < 0) return i
+    }
+    return 1
+  }
+
   function decide(observation, memory) {
     const mem0 = normalizeMemory(memory)
     const now = observation.now
     const page = observation.page || {}
     const focus = observation.focus || {}
+    const card = observation.card || { active: 1, total: 1 }
 
     // 1. 用户按了「停止」
     if (observation.userStopped) return stop(mem0, STOP_REASON.USER_STOPPED)
@@ -163,41 +221,50 @@
       return wait(mem)
     }
 
-    let mem = mem0
     const unfinished = taskPoints.filter((t) => !t.completed)
-    const playable = unfinished.filter((t) => t.kind !== KIND.PPT)
+    const playable = unfinished.filter(isPlayableUnfinished)
+    const unknown = unfinished.filter((t) => !isPlayableUnfinished(t) && t.kind !== KIND.PPT)
 
-    // 5. 未完成确认框：只剩 PPT 才可以替用户点，否则停在这里（ADR 0002 / ADR 0003）
+    // 5. 认不出的任务点类型：不猜（ADR 0005）
+    if (unknown.length > 0) return stop(mem0, STOP_REASON.UNKNOWN_TASK_POINT_KIND)
+
+    // 6. 卡片账本：可播单元要找遍本节点的全部卡片（DOM 里只有 active 那张的内容）
+    let mem = withCardScan(mem0, card, playable.length > 0, unfinished.length > 0)
+    const scannedAll = scanCoversNode(mem, card)
+
+    // 7. 未完成确认框（ADR 0002 / 0005）：只有「全部卡片扫遍、未完成的只剩 PPT」才替用户点确认
     if (page.confirmDialogVisible) {
-      // 读到「已无未完成任务点」却还弹着确认框 —— 两边有一边错了，停下让人看
-      if (unfinished.length === 0) return stop(mem, STOP_REASON.DIALOG_WITHOUT_UNFINISHED)
-      if (playable.length === 0) return throttledAction(ACTION.CONFIRM_ADVANCE, mem, now)
+      if (scannedAll && playable.length === 0) {
+        // 扫遍了却一个未完成任务点都没看到，平台却弹了确认框 —— 两边有一边错了，停下让人看
+        if (mem.scan && mem.scan.sawUnfinished) return throttledAction(ACTION.CONFIRM_ADVANCE, mem, now)
+        return stop(mem, STOP_REASON.DIALOG_WITHOUT_UNFINISHED)
+      }
       return stop(mem, STOP_REASON.MEDIA_INCOMPLETE_CONFIRM)
     }
 
     const media = observation.media || null
 
-    // 页面给出了「媒体」或「本来就没有可播的」，这个等待窗口就算结束了
-    if (media || playable.length === 0) mem = Object.assign({}, mem, { unreadySince: null })
+    // 页面给出了「媒体」，这个等待窗口就算结束了
+    if (media) mem = Object.assign({}, mem, { unreadySince: null })
 
-    // 6. 媒体加载失败
+    // 8. 媒体加载失败
     if (media && media.failed) return stop(mem, STOP_REASON.MEDIA_LOAD_FAILED)
 
-    // 7. 播完了：固定等一段再推进
+    // 9. 播完了：固定等一段，再去找下一个可播单元
     if (media && media.ended) {
       const endedAt = since(mem.endedAt, now)
       mem = Object.assign({}, mem, { endedAt })
       if (now - endedAt < C.ADVANCE_DELAY_MS) return wait(mem)
-      return advance(taskPoints, mem, now)
+      return locateOrAdvance()
     }
     mem = Object.assign({}, mem, { endedAt: null })
 
-    // 8. 暂停分两种，两种都不静默续播（ADR 0002）
+    // 10. 暂停分两种，两种都不静默续播（ADR 0002）
     if (media && media.paused) {
       const pausedSince = since(mem.pausedSince, now)
       mem = Object.assign({}, mem, { pausedSince })
 
-      // 8a. 已经起播过又被暂停：可能失焦，也可能是用户自己点的 —— 停下，等用户发话
+      // 10a. 已经起播过又被暂停：可能失焦，也可能是用户自己点的 —— 停下，等用户发话
       if (media.currentTime > 0) {
         if (now - pausedSince >= C.PAUSE_GRACE_MS) {
           return stop(mem, focus.lost ? STOP_REASON.FOCUS_LOST_PAUSE : STOP_REASON.MANUAL_PAUSE)
@@ -205,7 +272,7 @@
         return wait(mem)
       }
 
-      // 8b. 还没起播：替它请求一次起播，同一个媒体只请求一次（spec：不重试、不静音重试）
+      // 10b. 还没起播：替它请求一次起播，同一个媒体只请求一次（spec：不重试、不静音重试）
       if (mem.startRequestedKey !== media.key) {
         mem = Object.assign({}, mem, { startRequestedKey: media.key })
         return throttledAction(ACTION.START, mem, now)
@@ -215,7 +282,7 @@
     }
     mem = Object.assign({}, mem, { pausedSince: null })
 
-    // 9. 卡住：播放中 currentTime 长时间不前进
+    // 11. 卡住：播放中 currentTime 长时间不前进
     if (media) {
       const sample = !mem.lastSample || mem.lastSample.currentTime !== media.currentTime
         ? { at: now, currentTime: media.currentTime }
@@ -226,38 +293,48 @@
       mem = Object.assign({}, mem, { lastSample: null })
     }
 
-    // 10. 没有可播的任务点了：整门课跑完，或者推进
-    if (playable.length === 0) {
+    // 12. 本卡片还有未完成的可播任务点、媒体也已经在播 —— 什么都不做
+    if (playable.length > 0 && media) return wait(mem)
+
+    // 13. 该去找下一个可播单元了
+    return locateOrAdvance()
+
+    // 「推进」的全部出口：先在本卡片内定位；本卡片没有可播单元就切到还没找过的卡片；
+    // 全部卡片都找过、确实没有可播单元了，才去点「下一节」。
+    function locateOrAdvance() {
+      if (playable.length > 0) return waitForPlayable(null)
+      if (!scannedAll) return waitForPlayable({ card: nextCardToVisit(mem, card) })
       if (page.hasNext === false) return stop(mem, STOP_REASON.COURSE_COMPLETED)
       return advance(taskPoints, mem, now)
     }
 
-    // 11. 有可播的任务点但还没有媒体 —— 打开它；一直等不到就是页面没给出该有的东西
-    if (!media) {
+    // 还在等页面把可播单元交出来（媒体还没出现，或卡片还没切过去）——
+    // 一直等不到就停下，别在这儿硬撑
+    function waitForPlayable(extra) {
       const unreadySince = since(mem.unreadySince, now)
       mem = Object.assign({}, mem, { unreadySince })
       if (now - unreadySince >= C.UNREADY_TIMEOUT_MS) return stop(mem, STOP_REASON.MEDIA_NOT_FOUND)
-      return throttledAction(ACTION.OPEN_TASK_POINT, mem, now)
+      return throttledAction(ACTION.OPEN_TASK_POINT, mem, now, undefined, extra)
     }
-
-    // 12. 正在播：什么都不做
-    return wait(mem)
   }
 
   // ============================================================
   // 站点适配层 —— 全站唯一知道目标站点 DOM 的地方
   // ============================================================
   //
-  // ⚠️ 下面这些选择器/文案是按 docs/sites/xuexitong.md 记下的事实写的，但
-  // 「任务点已完成」的标记、音频任务点的结构、确认框的确切结构都还没在真实页面上见过。
-  // 它们全部集中在 ADAPTER_FACTS 里，实现时当场确认后改这一处即可。
+  // 下面这些选择器/文案都是按 docs/sites/xuexitong.md 里记下的**已确认事实**写的
+  // （卡片层、任务点容器、模块 iframe、确认框、风控文案）。站点改版时改这一处。
 
   const ADAPTER_FACTS = {
-    taskPointText: /任务点(未完成|已完成)/,
-    taskPointDoneText: /任务点已完成/,
-    kindPpt: /ppt/i,
-    kindAudio: /音频|audio/i,
-    kindVideo: /视频|video/i,
+    taskPointContainer: '.ans-attach-ct',       // 任务点容器：完成态看它的 ans-job-finished 类
+    jobFinishedClass: 'ans-job-finished',
+    moduleFrame: 'iframe[src*="/ananas/modules/"]', // 类型只看这个模块 iframe 的 src
+    moduleKind: /\/ananas\/modules\/([a-z]+)\//,
+    moduleKindMap: { video: KIND.VIDEO, audio: KIND.AUDIO, pdf: KIND.PPT },
+    cardSwitcher: 'ul.prev_ul > li',            // 卡片切换器（在主文档里），活动态带 active 类
+    cardId: /^dct\d+$/,                         // 事实上的卡片是 li#dctN
+    cardActiveClass: 'active',
+    nodeUnfinishedInput: '.posCatalog_active input.jobUnfinishCount', // 平台自己的「本节点待完成数」
     nextEntry: /下一节/,
     nextOnclick: /PCount\.next/,
     confirmText: /还有任务点未完成/,
@@ -315,55 +392,56 @@
     return text.replace(/\s+/g, '')
   }
 
-  // 元素上所有「可以用来搜」的标识拼成一段字符串，供关键词判断
-  function searchableAttrs(el) {
-    if (!el) return ''
-    const cls = typeof el.className === 'string' ? el.className : ''
-    const attr = function (name) { return (el.getAttribute && el.getAttribute(name)) || '' }
-    return [attr('title'), attr('aria-label'), cls, el.id].filter(Boolean).join(' ')
+  // 任务点的类型只看它自己的模块 iframe 的 src：卡片标签不代表内容，
+  // ans-job-icon 的类名对音频与 PPT 也是空的。认不出就返回 UNKNOWN，交给决策核心停下。
+  function classifyTaskPoint(el) {
+    const module = el.querySelector(ADAPTER_FACTS.moduleFrame)
+    if (!module) return KIND.UNKNOWN
+    const matched = ADAPTER_FACTS.moduleKind.exec(module.getAttribute('src') || '')
+    if (!matched) return KIND.UNKNOWN
+    return ADAPTER_FACTS.moduleKindMap[matched[1]] || KIND.UNKNOWN
   }
 
-  function classify(el) {
-    const hay = searchableAttrs(el) + '|' + (el.textContent || '').slice(0, 60)
-    if (ADAPTER_FACTS.kindPpt.test(hay)) return KIND.PPT
-    if (ADAPTER_FACTS.kindAudio.test(hay)) return KIND.AUDIO
-    if (ADAPTER_FACTS.kindVideo.test(hay)) return KIND.VIDEO
-    return KIND.VIDEO // 认不出来就按视频试；试不出媒体会停成 MEDIA_NOT_FOUND 并提示
+  // 模块 iframe 上的 jobid 属性是任务点的稳定标识；PPT 有时只写在 data 里
+  function taskPointId(el, index) {
+    const module = el.querySelector(ADAPTER_FACTS.moduleFrame)
+    let jobid = module ? module.getAttribute('jobid') : ''
+    if (!jobid && module) {
+      try {
+        const data = JSON.parse(module.getAttribute('data') || '{}')
+        jobid = data.jobid || data._jobid || ''
+      } catch (e) {
+        jobid = ''
+      }
+    }
+    return jobid || classifyTaskPoint(el) + '#' + index
   }
 
   let taskPointCache = { at: 0, items: [] }
 
+  // 任务点 = 卡片文档里的 .ans-attach-ct 容器，**不**按文案或 icon 找：
+  // 已完成的任务点没有「已完成」文案，ans-job-icon 也可能整个不存在。
   function scanTaskPoints() {
-    const matched = []
+    const found = []
     eachDocument(document, function (doc) {
       let all
       try {
-        all = doc.querySelectorAll('body *')
+        all = doc.querySelectorAll(ADAPTER_FACTS.taskPointContainer)
       } catch (e) {
         return
       }
-      for (let i = 0; i < all.length; i++) {
-        const el = all[i]
-        if (ADAPTER_FACTS.taskPointText.test(searchableAttrs(el)) || ADAPTER_FACTS.taskPointText.test(ownText(el))) {
-          matched.push(el)
-        }
-      }
+      for (let i = 0; i < all.length; i++) found.push(all[i])
     })
-    // 只保留最深的匹配元素，避免祖先把自己算成任务点
-    const leaves = matched.filter(function (el) {
-      return !matched.some(function (other) {
-        return other !== el && el.contains(other)
-      })
+    // 容器一般不套容器；稳妥起见把嵌套的内层去掉，免得一个任务点被数两次
+    const containers = found.filter(function (el) {
+      return !found.some(function (other) { return other !== el && other.contains(el) })
     })
-    return leaves.map(function (el, index) {
-      const label = searchableAttrs(el) + '|' + ownText(el)
-      const container = el.closest('li, [role="option"], a, [onclick]') || el
+    return containers.map(function (el, index) {
       return {
-        id: (container.id || '') + '#' + index + '#' + ownText(el),
-        kind: classify(container),
-        completed: ADAPTER_FACTS.taskPointDoneText.test(label),
-        label: (ownText(el) || searchableAttrs(el) || '任务点').slice(0, 40),
-        el: container,
+        id: taskPointId(el, index),
+        kind: classifyTaskPoint(el),
+        completed: el.classList.contains(ADAPTER_FACTS.jobFinishedClass),
+        el: el,
       }
     })
   }
@@ -377,8 +455,37 @@
     return taskPointCache.items
   }
 
-  // 页面上可能同时留着上一个任务点的 <video>（切节点时未必被移除）。
-  // 所以先排除已播完的、再排除不可见的，免得把旧媒体当成当前这个。
+  // 有 src / currentSrc / <source> / 读得到的 duration 才算「有可用源」。
+  // 卡片文档里那个 <audio id="auditionAudio" src=""> 四样都没有。
+  function hasUsableSource(el) {
+    if (!el) return false
+    if (el.currentSrc) return true
+    if (el.getAttribute('src')) return true
+    if (el.querySelector && el.querySelector('source[src]')) return true
+    return typeof el.duration === 'number' && isFinite(el.duration) && el.duration > 0
+  }
+
+  // 媒体元素在任务点的模块 iframe 里，它自己看不到外面的容器，要靠 frameElement 往上一层找
+  function containingTaskPoint(el) {
+    let frame = null
+    try {
+      const doc = el.ownerDocument
+      frame = doc && doc.defaultView && doc.defaultView.frameElement
+    } catch (e) {
+      frame = null
+    }
+    return frame && frame.closest ? frame.closest(ADAPTER_FACTS.taskPointContainer) : null
+  }
+
+  // 「第一个未完成的可播单元」——定位动作与起播都以它为准
+  function firstPlayableUnfinished() {
+    return currentTaskPoints().filter(isPlayableUnfinished)[0] || null
+  }
+
+  // 一张卡片会把它的全部任务点一次渲染出来，页面上同时躺着好几个媒体元素。
+  // 打分顺序：有可用源 → 属于未完成的可播任务点 → 没播完 → 可见。
+  // 于是每个文档里那个空的 AI 试听 <audio> 排在最后（没有可用源的元素根本不会被当成媒体，
+  // 见 observeMedia）。
   function findMedia() {
     const candidates = []
     eachDocument(document, function (doc) {
@@ -390,18 +497,97 @@
       }
       for (let i = 0; i < all.length; i++) candidates.push(all[i])
     })
+    const playable = currentTaskPoints().filter(isPlayableUnfinished)
     let best = null
     let bestScore = Infinity
     for (let i = 0; i < candidates.length; i++) {
       const el = candidates[i]
-      const ended = el.ended ? 2 : 0
-      const hidden = el.tagName === 'AUDIO' || visible(el) ? 0 : 1 // <audio> 没有可见盒子
-      if (ended + hidden < bestScore) {
+      const container = containingTaskPoint(el)
+      const inUnfinished = !!container && playable.some(function (t) { return t.el === container })
+      const score = (hasUsableSource(el) ? 0 : 8)
+        + (inUnfinished ? 0 : 4)
+        + (el.ended ? 2 : 0)
+        + (el.tagName === 'AUDIO' || visible(el) ? 0 : 1) // <audio> 没有可见盒子
+      if (score < bestScore) {
         best = el
-        bestScore = ended + hidden
+        bestScore = score
       }
     }
     return best
+  }
+
+  // 卡片：主文档里的切换器，同一时刻只有带 active 的那张把内容渲染进 iframe。
+  // 事实上的卡片是 `li#dctN`（见 docs/sites），所以先按 id 收一遍，收不到才退回全部 li。
+  function cardList() {
+    let all = []
+    try {
+      all = Array.prototype.slice.call(document.querySelectorAll(ADAPTER_FACTS.cardSwitcher))
+    } catch (e) {
+      return []
+    }
+    const byId = all.filter(function (li) { return ADAPTER_FACTS.cardId.test(li.id) })
+    return byId.length > 0 ? byId : all
+  }
+
+  function cardIndexOf(cards) {
+    for (let i = 0; i < cards.length; i++) {
+      if (cards[i].classList.contains(ADAPTER_FACTS.cardActiveClass)) return i
+    }
+    return -1
+  }
+
+  function observeCard() {
+    const cards = cardList()
+    const active = cardIndexOf(cards)
+    // 只有一张卡片（或压根没有切换器）：当前这张就是全部
+    if (cards.length < 2) return { active: 1, total: 1 }
+    // 有切换器却认不出活动卡片：卡片层不可信，交给决策核心按「没找遍」处理（宁可停下也不跳）
+    if (active < 0) return { active: 0, total: 0 }
+    return { active: active + 1, total: cards.length }
+  }
+
+  // 切到指定的那张卡片（1 起算）。点在站点自己的 changeDisplayContent 入口上。
+  // 目标卡片由决策核心按 spec 的顺序给出（从第 1 张卡片起）。
+  function switchToCard(index) {
+    const cards = cardList()
+    const target = cards[index - 1]
+    if (!target || !target.click) return
+    if (target.classList.contains(ADAPTER_FACTS.cardActiveClass)) return
+    target.click()
+    taskPointCache = { at: 0, items: [] } // 卡片重渲染，缓存的元素引用立刻作废
+  }
+
+  // 把要播的任务点带到眼前。起播本身不需要点任何入口（实测直接 play() 即可，
+  // 模块自己会上报），这里只是不让它一直在屏幕外播。
+  function bringIntoView(el) {
+    if (!el || !el.scrollIntoView) return
+    try {
+      el.scrollIntoView({ block: 'center' })
+    } catch (e) {
+      /* 老引擎不认 options，忽略 */
+    }
+  }
+
+  // 「定位到第一个未完成的可播单元」：
+  // 决策核心说切卡片（带 card 序号）就切过去；没说就说明可播单元在本卡片里，把它带到眼前。
+  function locateNextPlayable(cardIndex) {
+    if (cardIndex) {
+      switchToCard(cardIndex)
+      return
+    }
+    const target = firstPlayableUnfinished()
+    if (target) bringIntoView(target.el)
+  }
+
+  // 平台自己在章节树上给的「本节点待完成数」（含 PPT），只用来展示
+  function readNodeUnfinished() {
+    try {
+      const input = document.querySelector(ADAPTER_FACTS.nodeUnfinishedInput)
+      const value = input ? Number(input.value) : NaN
+      return isFinite(value) ? value : null
+    } catch (e) {
+      return null
+    }
   }
 
   function findInDocuments(selector, test) {
@@ -487,10 +673,11 @@
 
   let mediaSeq = 0
 
-  // 同一个媒体元素的稳定标识。刻意不用 src/currentSrc —— 它们在加载中会变。
+  // 同一个媒体元素的稳定标识。刻意不用 src/currentSrc —— 它们在加载中会变；
+  // 也不能用 el.id —— 同一张卡片里 10 个播放器都叫 video_html5_api。
   function mediaKey(el) {
     if (!el.__autoLessonKey) {
-      el.__autoLessonKey = el.getAttribute('data-objectid') || el.id || 'm' + (++mediaSeq)
+      el.__autoLessonKey = el.getAttribute('data-objectid') || 'm' + (++mediaSeq)
     }
     return el.__autoLessonKey
   }
@@ -498,12 +685,17 @@
   function observeMedia() {
     const el = findMedia()
     if (!el) return null
+    // 没有可用源的元素不是「能播的媒体」：它是卡片里那个 src="" 的 AI 试听音频，
+    // 或模块 iframe 还没渲染出播放器。当成 null 等真媒体出现，别拿它当故障或去起播。
+    if (!hasUsableSource(el)) return null
     return {
       key: mediaKey(el),
       currentTime: Number(el.currentTime) || 0,
       paused: !!el.paused,
       ended: !!el.ended,
-      failed: !!el.error || el.networkState === 3, // 3 = NETWORK_NO_SOURCE
+      // 只看 error：preload="none" 的播放器在还没开始加载时也会报
+      // networkState=3（NETWORK_NO_SOURCE）而 error 为 null，那不是故障
+      failed: !!el.error,
     }
   }
 
@@ -521,6 +713,7 @@
         riskControlWarning: detectRiskControl(),
         faceCaptureRequired: detectFaceCapture(),
       },
+      card: observeCard(),
       taskPoints: taskPoints,
       media: observeMedia(),
     }
@@ -528,6 +721,8 @@
 
   function attemptPlay(el) {
     if (!el || !el.play) return
+    const container = containingTaskPoint(el)
+    if (container) bringIntoView(container)
     const result = el.play()
     if (result && typeof result.catch === 'function') {
       result.catch(function () { /* 按 spec 不重试，交给决策核心的时限去判定 */ })
@@ -545,15 +740,26 @@
 
     observe: observe,
 
+    // 进度是**当前卡片**的 x/y（DOM 里只有这一张卡片的任务点），另加平台自己给的
+    // 「本节点未完成 N（含 PPT）」—— 那个数含 PPT、不会归零，所以不写成「还剩 N 个要做」
     progressText: function () {
       const points = currentTaskPoints()
-      if (points.length === 0) return '任务点：尚未采到'
-      const done = points.filter(function (t) { return t.completed }).length
+      const card = observeCard()
+      const parts = []
+      if (points.length === 0) {
+        parts.push('任务点：尚未采到')
+      } else {
+        const done = points.filter(function (t) { return t.completed }).length
+        parts.push('本卡片 ' + done + '/' + points.length)
+      }
+      if (card.total > 1) parts.push('卡片 ' + card.active + '/' + card.total)
+      const nodeUnfinished = readNodeUnfinished()
+      if (nodeUnfinished !== null) parts.push('本节点未完成 ' + nodeUnfinished + '（含 PPT）')
       const media = findMedia()
-      const clock = media && media.duration && isFinite(media.duration)
-        ? ' | ' + Math.floor(media.currentTime) + '/' + Math.floor(media.duration) + 's'
-        : ''
-      return '本节进度：' + done + '/' + points.length + clock
+      if (media && media.duration && isFinite(media.duration)) {
+        parts.push(Math.floor(media.currentTime) + '/' + Math.floor(media.duration) + 's')
+      }
+      return parts.join('　|　')
     },
 
     perform: function (action) {
@@ -561,13 +767,9 @@
         case ACTION.START:
           attemptPlay(findMedia())
           return
-        case ACTION.OPEN_TASK_POINT: {
-          const target = currentTaskPoints().filter(function (t) {
-            return !t.completed && t.kind !== KIND.PPT
-          })[0]
-          if (target && target.el && target.el.click) target.el.click()
+        case ACTION.OPEN_TASK_POINT:
+          locateNextPlayable(action.card)
           return
-        }
         case ACTION.ADVANCE: {
           const entry = findNextEntry()
           if (entry && entry.click) entry.click()
@@ -587,7 +789,7 @@
     // 「继续」是人的动作，不是脚本的决策：直接替用户按一次播放
     playOnce: function () {
       const media = findMedia()
-      if (media && media.paused && !media.ended) attemptPlay(media)
+      if (media && hasUsableSource(media) && media.paused && !media.ended) attemptPlay(media)
     },
   }
 
@@ -599,9 +801,10 @@
     loginRiskControl: '检测到多端登录风控警告，已停下 —— 请只保留一个设备在线',
     faceCaptureCourse: '这门课启用了人脸抓拍，脚本无法自动化，已放弃',
     taskPointsNotFound: '一直没找到任务点，可能不是学习页面，或页面结构变了',
-    mediaNotFound: '任务点已打开但等不到视频/音频元素，可能任务点类型识别有误',
-    mediaIncompleteConfirm: '这个节点还有没看完的视频，平台弹出了确认框 —— 脚本不替你确认',
-    dialogWithoutUnfinished: '平台弹出「还有任务点未完成」，但脚本读到的任务点却都已完成 —— 判定不可信，已停下',
+    mediaNotFound: '一直没找到可播的视频/音频元素，已停下 —— 可能是任务点结构变了，或卡片层认不出来',
+    unknownTaskPointKind: '有个未完成任务点的模块类型认不出来（不是视频/音频/PPT），已停下 —— 不猜着处理',
+    mediaIncompleteConfirm: '平台弹出了「还有任务点未完成」，但脚本还没把本节点的可播任务点找完/播完 —— 判断不可信，脚本不替你确认',
+    dialogWithoutUnfinished: '平台弹出「还有任务点未完成」，但脚本扫遍本节点却一个未完成任务点都没看到 —— 判定不可信，已停下',
     mediaLoadFailed: '视频加载失败，已停下',
     focusLostPause: '窗口失去焦点后播放被暂停，已停下 —— 请回到窗口后点「继续」',
     manualPause: '播放被暂停了，已停下 —— 点「继续」接着跑',

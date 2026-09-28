@@ -51,6 +51,7 @@ function observe(over) {
     userStopped: false,
     focus: { lost: false },
     page: page(),
+    card: { active: 1, total: 1 }, // 默认「本节点只有一张卡片」，卡片层的用例自己指定
     taskPoints: [video('v1', false)],
     media: null,
   }, over)
@@ -99,7 +100,19 @@ const CASES = [
     expectMemory: (m) => m.unreadySince === NOW - C.UNREADY_TIMEOUT_MS + 1,
   },
 
-  // ---- 未完成确认框（ADR 0002 / ADR 0003） ----
+  // ---- 认不出的任务点类型（ADR 0005：不猜，停下） ----
+  {
+    name: '有未完成的任务点认不出类型 → 停下',
+    obs: observe({ taskPoints: [{ id: 'u1', kind: 'unknown', completed: false }] }),
+    expect: { kind: A.STOP, reason: R.UNKNOWN_TASK_POINT_KIND },
+  },
+  {
+    name: '已完成的任务点认不出类型 → 不拦路',
+    obs: observe({ taskPoints: [{ id: 'u1', kind: 'unknown', completed: true }, video('v1', false)] }),
+    expect: { kind: A.OPEN_TASK_POINT },
+  },
+
+  // ---- 未完成确认框（ADR 0002 / ADR 0005） ----
   {
     name: '确认框 + 只剩 PPT 未完成 → 代为点头确认推进',
     obs: observe({ taskPoints: [video('v1', true), ppt('p1', false)], page: page({ confirmDialogVisible: true }) }),
@@ -157,10 +170,83 @@ const CASES = [
     expectMemory: (m) => m.endedAt === NOW - C.ADVANCE_DELAY_MS + 1,
   },
   {
-    name: '播完且等够了 → 推进',
+    name: '播完且等够了 → 去找下一个未完成的可播单元',
     obs: observe({ media: media({ ended: true, currentTime: 88 }) }),
     mem: () => memory({ endedAt: NOW - C.ADVANCE_DELAY_MS }),
+    expect: { kind: A.OPEN_TASK_POINT },
+  },
+  {
+    name: '播完且等够了、本卡片已无未完成可播 → 点下一节',
+    obs: observe({ taskPoints: [video('v1', true)], media: media({ ended: true, currentTime: 88 }) }),
+    mem: () => memory({ endedAt: NOW - C.ADVANCE_DELAY_MS }),
     expect: { kind: A.ADVANCE },
+  },
+
+  // ---- 卡片层：同一时刻只有 active 那张卡片的内容在 DOM 里 ----
+  {
+    name: '卡片内还有下一个未完成的可播任务点 → 卡片内推进，不换卡片',
+    obs: observe({ taskPoints: [video('v1', true), video('v2', false)], card: { active: 1, total: 4 }, media: null }),
+    expect: { kind: A.OPEN_TASK_POINT, card: null },
+    expectMemory: (m) => m.scan === null,
+  },
+  {
+    name: '本卡片没有可播的了、本节点还有卡片没扫过 → 切下一张卡片',
+    obs: observe({ taskPoints: [video('v1', true)], card: { active: 1, total: 2 }, media: null }),
+    expect: { kind: A.OPEN_TASK_POINT, card: 2 },
+    expectMemory: (m) => m.scan && m.scan.visited.length === 1 && m.scan.visited[0] === 1,
+  },
+  {
+    name: '本卡片只剩 PPT、但还有卡片没扫过 → 回到第 1 张卡片接着找，不点下一节',
+    obs: observe({ taskPoints: [ppt('p1', false)], card: { active: 2, total: 4 }, media: null }),
+    expect: { kind: A.OPEN_TASK_POINT, card: 1 },
+  },
+  {
+    name: '本节点的卡片层认不出来 → 不瞎切卡片、也不点下一节',
+    obs: observe({ taskPoints: [ppt('p1', false)], card: { active: 0, total: 0 }, media: null }),
+    expect: { kind: A.OPEN_TASK_POINT, card: null },
+    expectMemory: (m) => m.scan === null,
+  },
+  {
+    name: '最后一张卡片也扫过、只剩别的卡片里的 PPT → 点下一节',
+    obs: observe({ taskPoints: [video('v1', true)], card: { active: 2, total: 2 }, media: null }),
+    mem: () => memory({ scan: { total: 2, visited: [1], sawUnfinished: true } }),
+    expect: { kind: A.ADVANCE },
+  },
+  {
+    name: '本节点卡片数变了 → 账本作废，重新扫',
+    obs: observe({ taskPoints: [video('v1', true)], card: { active: 1, total: 3 }, media: null }),
+    mem: () => memory({ scan: { total: 2, visited: [1, 2], sawUnfinished: true } }),
+    expect: { kind: A.OPEN_TASK_POINT },
+    expectMemory: (m) => m.scan.total === 3 && m.scan.visited.length === 1,
+  },
+  {
+    name: '确认框 + 扫遍全部卡片、只剩 PPT → 代为点头确认推进',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      card: { active: 2, total: 2 },
+      page: page({ confirmDialogVisible: true }),
+    }),
+    mem: () => memory({ scan: { total: 2, visited: [1], sawUnfinished: true } }),
+    expect: { kind: A.CONFIRM_ADVANCE },
+  },
+  {
+    name: '确认框 + 本节点还有卡片没扫过 → 停下，不代确认',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      card: { active: 1, total: 2 },
+      page: page({ confirmDialogVisible: true }),
+    }),
+    expect: { kind: A.STOP, reason: R.MEDIA_INCOMPLETE_CONFIRM },
+  },
+  {
+    name: '确认框 + 扫遍全部卡片却一个未完成任务点都没看到 → 停下',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      card: { active: 2, total: 2 },
+      page: page({ confirmDialogVisible: true }),
+    }),
+    mem: () => memory({ scan: { total: 2, visited: [1], sawUnfinished: false } }),
+    expect: { kind: A.STOP, reason: R.DIALOG_WITHOUT_UNFINISHED },
   },
 
   // ---- 暂停 ----
@@ -321,6 +407,13 @@ for (const testCase of cases) {
   }
   if (testCase.expect.reason && action.reason !== testCase.expect.reason) {
     problems.push('停止原因应为 ' + testCase.expect.reason + '，实际 ' + action.reason)
+  }
+  // expect.card：动作要求切到哪张卡片（null = 明确要求不切卡片，保持在本卡片内）
+  if (testCase.expect.card !== undefined) {
+    const actualCard = action.card === undefined ? null : action.card
+    if (actualCard !== testCase.expect.card) {
+      problems.push('该切到的卡片应为 ' + testCase.expect.card + '，实际 ' + actualCard)
+    }
   }
   if (testCase.expectMemory && !testCase.expectMemory(result.memory)) {
     problems.push('记忆不符：' + JSON.stringify(result.memory))
