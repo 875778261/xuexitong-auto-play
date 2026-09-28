@@ -13,6 +13,8 @@
 | `mobilelearn.` / `stat2-ans.` / `robot-lc.` / `noteyd.` | 活动、统计、数字人、笔记等辅助接口 |
 
 - **找目录（章节树）的必经路径**：课程页 `mooc2-ans/mycourse/stu?courseid=…&clazzid=…&cpi=…` 打开后默认落在**「任务」**页，**章节树要点一下「章节」标签才会渲染**；而且它在一个**跨域 iframe** 里，主文档的 `contentDocument` 读不到——得用 Playwright 的 `page.frames()` 逐帧读。节点名与「未完成数」都在那一帧里。
+- ⚠️ **更正上一轮的一条结论**：`playwright-cli` 的 `find`/`snapshot` **能**读到那个跨域帧里的章节树（可访问性树会穿过去），而**点节点用快照里的 ref（形如 `f124e93`）是可行的**——2026-09-28 实测点它直接跳到该节点的学习页。上一轮记的「getByRole / getByText 够不到那个帧」只对那两种定位方式成立，别据此认为 CLI 碰不到这棵树。
+- 学习页上也有同一棵树（侧边栏 `.posCatalog_active` 就是当前节点），**不用回课程页也能切节点**。
 
 ## 学习页面的层级
 

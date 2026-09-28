@@ -66,6 +66,18 @@
     COURSE_COMPLETED: 'courseCompleted',
   }
 
+  // 「等待」和停止原因一样可枚举 —— 状态条上的倒计时就靠它（见 issues/02）。
+  // ⚠️ 同款纪律：新增一条就补一条用例；删掉一条就连它的倒计时文案一起删。
+  const PENDING = {
+    EMPTY_CARD: 'emptyCard',             // 本卡片 0 个任务点，等它渲染出来
+    ADVANCE_DELAY: 'advanceDelay',       // 媒体播完后的固定延迟
+    ADVANCE_COOLDOWN: 'advanceCooldown', // 刚推进过，等同类动作的冷却
+    UNREADY: 'unready',                  // 等页面交出可播单元，等不到就停下
+    START_GIVEUP: 'startGiveup',         // 已请求起播，却一直没开始播
+    PAUSED: 'paused',                    // 已起播的媒体被暂停了
+    STALLED: 'stalled',                  // 在播，但进度不前进
+  }
+
   const KIND = { VIDEO: 'video', AUDIO: 'audio', PPT: 'ppt', UNKNOWN: 'unknown' }
 
   // ============================================================
@@ -103,6 +115,7 @@
       advanceSignature: null,  // 上次点「下一节」时看到的任务点签名
       startRequestedKey: null, // 已经替哪个媒体请求过起播（spec：起播不重试）
       scan: null,              // 本轮「找可播单元」的卡片账本：{ total, visited, sawUnfinished }
+      pending: null,           // 当前这次等待：{ kind ∈ PENDING, dueAt }；没有倒计时可报就是 null
     }
   }
 
@@ -115,22 +128,34 @@
     return previous === null ? now : previous
   }
 
-  function wait(mem) {
-    return { action: { kind: ACTION.WAIT }, memory: mem }
+  // 这一次等待是等什么、等到什么时候 —— 状态条拿它报倒计时。
+  // 纯数据，不含文案：文案在状态条那一层（PENDING_TEXT）。
+  function pendingOf(kind, dueAt) {
+    return { kind: kind, dueAt: dueAt }
+  }
+
+  // pending 省略 = 这一次等待没有倒计时可报（例如「正在播、什么都不做」）
+  function wait(mem, pending) {
+    return { action: { kind: ACTION.WAIT }, memory: Object.assign({}, mem, { pending: pending || null }) }
   }
 
   function stop(mem, reason) {
-    return { action: { kind: ACTION.STOP, reason }, memory: mem }
+    return { action: { kind: ACTION.STOP, reason }, memory: Object.assign({}, mem, { pending: null }) }
   }
 
-  // 同类动作在冷却期内不重复发出 —— 让「点一下」不会变成「点很多下」
+  // 同类动作在冷却期内不重复发出 —— 让「点一下」不会变成「点很多下」。
+  // 冷却期的倒计时只对「推进」这一支单独报：定位那一支永远与「再等 N 秒就停下」并存，
+  // 报后者更有用（见 waitForPlayable），所以它不单独占一个 PENDING。
   function throttledAction(kind, mem, now, guardMs, extra) {
     const window = guardMs === undefined ? C.ACTION_COOLDOWN_MS : guardMs
     const last = mem.lastAction
-    if (last && last.kind === kind && now - last.at < window) return wait(mem)
+    if (last && last.kind === kind && now - last.at < window) {
+      const advancing = kind === ACTION.ADVANCE || kind === ACTION.CONFIRM_ADVANCE
+      return advancing ? wait(mem, pendingOf(PENDING.ADVANCE_COOLDOWN, last.at + window)) : wait(mem)
+    }
     return {
       action: Object.assign({ kind }, extra || null),
-      memory: Object.assign({}, mem, { lastAction: { kind, at: now } }),
+      memory: Object.assign({}, mem, { lastAction: { kind, at: now }, pending: null }),
     }
   }
 
@@ -251,7 +276,9 @@
 
     // 7. 本卡片是空的：窗口期内先等；窗口期过了就照卡片账本办 ——
     //    没扫遍本节点的其他卡片就去扫，扫遍了就推进（ADR 0006：只剩资料附件的节点直接推进）
-    if (emptyCardProvisional) return wait(mem)
+    if (emptyCardProvisional) {
+      return wait(mem, pendingOf(PENDING.EMPTY_CARD, emptyCardSince + C.EMPTY_CARD_GRACE_MS))
+    }
     if (taskPoints.length === 0) return locateOrAdvance()
 
     const media = observation.media || null
@@ -266,7 +293,9 @@
     if (media && media.ended) {
       const endedAt = since(mem.endedAt, now)
       mem = Object.assign({}, mem, { endedAt })
-      if (now - endedAt < C.ADVANCE_DELAY_MS) return wait(mem)
+      if (now - endedAt < C.ADVANCE_DELAY_MS) {
+        return wait(mem, pendingOf(PENDING.ADVANCE_DELAY, endedAt + C.ADVANCE_DELAY_MS))
+      }
       return locateOrAdvance()
     }
     mem = Object.assign({}, mem, { endedAt: null })
@@ -281,32 +310,37 @@
         if (now - pausedSince >= C.PAUSE_GRACE_MS) {
           return stop(mem, focus.lost ? STOP_REASON.FOCUS_LOST_PAUSE : STOP_REASON.MANUAL_PAUSE)
         }
-        return wait(mem)
+        return wait(mem, pendingOf(PENDING.PAUSED, pausedSince + C.PAUSE_GRACE_MS))
       }
 
       // 10b. 还没起播：替它请求一次起播，同一个媒体只请求一次（spec：不重试、不静音重试）
+      //      起播请求**不走冷却**：同一个媒体只请求一次已由 startRequestedKey 守住；
+      //      再叠一层冷却反而会把那次请求吞掉（冷却返回 WAIT 时 key 已经记下，之后不再发）
       if (mem.startRequestedKey !== media.key) {
         mem = Object.assign({}, mem, { startRequestedKey: media.key })
-        return throttledAction(ACTION.START, mem, now)
+        return throttledAction(ACTION.START, mem, now, 0)
       }
       if (now - pausedSince >= C.START_GIVEUP_MS) return stop(mem, STOP_REASON.PLAYBACK_REFUSED)
-      return wait(mem)
+      return wait(mem, pendingOf(PENDING.START_GIVEUP, pausedSince + C.START_GIVEUP_MS))
     }
     mem = Object.assign({}, mem, { pausedSince: null })
 
     // 11. 卡住：播放中 currentTime 长时间不前进
+    let pending = null
     if (media) {
-      const sample = !mem.lastSample || mem.lastSample.currentTime !== media.currentTime
-        ? { at: now, currentTime: media.currentTime }
-        : mem.lastSample
+      // 本 tick 的 currentTime 和上次采样一样 = 进度真的没动，这时才报倒计时。
+      // 正常播放时每次采样都在前进，报的是「还剩 Ns」，而不是一条吓人的「会停下」
+      const advanced = !mem.lastSample || mem.lastSample.currentTime !== media.currentTime
+      const sample = advanced ? { at: now, currentTime: media.currentTime } : mem.lastSample
       mem = Object.assign({}, mem, { lastSample: sample })
       if (now - sample.at >= C.STALL_TIMEOUT_MS) return stop(mem, STOP_REASON.STALLED)
+      if (!advanced) pending = pendingOf(PENDING.STALLED, sample.at + C.STALL_TIMEOUT_MS)
     } else {
       mem = Object.assign({}, mem, { lastSample: null })
     }
 
     // 12. 本卡片还有未完成的可播任务点、媒体也已经在播 —— 什么都不做
-    if (playable.length > 0 && media) return wait(mem)
+    if (playable.length > 0 && media) return wait(mem, pending)
 
     // 13. 该去找下一个可播单元了
     return locateOrAdvance()
@@ -327,7 +361,10 @@
       // 要切卡片了：页面马上要换一张，重新开始算「本卡片是空的」
       mem = Object.assign({}, mem, { unreadySince, emptyCardSince: null })
       if (now - unreadySince >= C.UNREADY_TIMEOUT_MS) return stop(mem, STOP_REASON.MEDIA_NOT_FOUND)
-      return throttledAction(ACTION.OPEN_TASK_POINT, mem, now, undefined, extra)
+      const result = throttledAction(ACTION.OPEN_TASK_POINT, mem, now, undefined, extra)
+      if (result.action.kind !== ACTION.WAIT) return result
+      // 「再等多久就停下」比「多久后重试定位」要紧：两个倒计时并存时留前者
+      return wait(result.memory, pendingOf(PENDING.UNREADY, unreadySince + C.UNREADY_TIMEOUT_MS))
     }
   }
 
@@ -504,6 +541,9 @@
   // 打分顺序：有可用源 → 属于未完成的可播任务点 → 没播完 → 可见。
   // 于是每个文档里那个空的 AI 试听 <audio> 排在最后（没有可用源的元素根本不会被当成媒体，
   // 见 observeMedia）。
+  // ⚠️ 副作用（2026-09-28 真机实测）：因为「没播完」也参与打分，一条媒体播完后只要本卡片还有
+  // 别的未完成任务点，这里就会选中**下一个**媒体——决策核心里 `media.ended` 那一支
+  // （播完固定等 ADVANCE_DELAY_MS）实际上只在**本卡片最后一个可播任务点**播完时才走到。
   function findMedia() {
     const candidates = []
     eachDocument(document, function (doc) {
@@ -759,8 +799,9 @@
     observe: observe,
 
     // 进度是**当前卡片**的 x/y（DOM 里只有这一张卡片的任务点），另加平台自己给的
-    // 「本节点未完成 N（含 PPT）」—— 那个数含 PPT、不会归零，所以不写成「还剩 N 个要做」
-    progressText: function () {
+    // 「本节点未完成 N（含 PPT）」—— 那个数含 PPT、不会归零，所以不写成「还剩 N 个要做」。
+    // memory 只用来读 pending 那条倒计时（唯一来源在决策核心，适配层不自己算时限）
+    progressText: function (memory) {
       const points = currentTaskPoints()
       const card = observeCard()
       const parts = []
@@ -774,9 +815,14 @@
       const nodeUnfinished = readNodeUnfinished()
       if (nodeUnfinished !== null) parts.push('本节点未完成 ' + nodeUnfinished + '（含 PPT）')
       const media = findMedia()
-      if (media && media.duration && isFinite(media.duration)) {
+      const playing = media && media.duration && isFinite(media.duration)
+      if (playing) {
+        const remain = Math.max(0, Math.floor(media.duration - media.currentTime))
         parts.push(Math.floor(media.currentTime) + '/' + Math.floor(media.duration) + 's')
+        if (remain > 0) parts.push('还剩 ' + remain + 's')
       }
+      const countdown = pendingText(memory)
+      if (countdown) parts.push(countdown)
       return parts.join('　|　')
     },
 
@@ -814,20 +860,49 @@
   // ============================================================
   // 状态条（Shadow DOM 隔离，不碰站点样式）
   // ============================================================
+  // 文案里的时限一律由常量拼 —— 手写的数字迟早与常量对不上（「文案说 20 秒、代码等 30 秒」）
+  function secs(ms) {
+    return Math.round(ms / 1000)
+  }
+
   const REASON_TEXT = {
     userStopped: '你停止了脚本',
     loginRiskControl: '检测到多端登录风控警告，已停下 —— 请只保留一个设备在线',
     faceCaptureCourse: '这门课启用了人脸抓拍，脚本无法自动化，已放弃',
-    mediaNotFound: '一直没找到可播的视频/音频元素，已停下 —— 可能是任务点结构变了，或卡片层认不出来',
+    mediaNotFound: '一直没找到可播的视频/音频元素，等了 ' + secs(C.UNREADY_TIMEOUT_MS) +
+      ' 秒也没有，已停下 —— 可能是任务点结构变了，或卡片层认不出来',
     mediaIncompleteConfirm: '平台弹出了「还有任务点未完成」，但脚本还没把本节点的可播任务点找完/播完 —— 判断不可信，脚本不替你确认',
     dialogWithoutUnfinished: '平台弹出「还有任务点未完成」，但脚本扫遍本节点却一个未完成任务点都没看到 —— 判定不可信，已停下',
-    mediaLoadFailed: '视频加载失败，已停下',
+    mediaLoadFailed: '视频/音频加载失败，已停下',
     focusLostPause: '窗口失去焦点后播放被暂停，已停下 —— 请回到窗口后点「继续」',
     manualPause: '播放被暂停了，已停下 —— 点「继续」接着跑',
-    stalled: '播放卡住了（进度长时间不前进），已停下',
-    playbackRefused: '浏览器拒绝了自动播放，已停下 —— 请手动点一下播放',
-    courseCompleted: '整门课已跑完',
+    stalled: '播放卡住了（进度 ' + secs(C.STALL_TIMEOUT_MS) + ' 秒不前进），已停下',
+    playbackRefused: '浏览器拒绝了自动播放（请求起播后 ' + secs(C.START_GIVEUP_MS) +
+      ' 秒仍没动），已停下 —— 请手动点一下播放',
+    courseCompleted: '没有「下一节」入口了，脚本结束 —— 若后面还有内容，多半是页面结构变了',
     running: '正在运行',
+  }
+
+  // 倒计时的措辞：到期会「动手」的用「N 秒后…」，到期会「停下」的用「再等 N 秒…」——
+  // 两类必须一眼分得开，否则「还剩 4 秒」到底是动手还是放弃都得猜
+  const PENDING_TEXT = {
+    [PENDING.EMPTY_CARD]: function (s) { return s + ' 秒后跳过本卡片' },
+    [PENDING.ADVANCE_DELAY]: function (s) { return s + ' 秒后继续推进' },
+    [PENDING.ADVANCE_COOLDOWN]: function (s) { return s + ' 秒后重试推进' },
+    [PENDING.UNREADY]: function (s) { return '再等 ' + s + ' 秒没动静就停下' },
+    [PENDING.START_GIVEUP]: function (s) { return '再等 ' + s + ' 秒仍未开始播放　将判定被拒绝' },
+    [PENDING.PAUSED]: function (s) { return '再等 ' + s + ' 秒仍暂停　将停下' },
+    [PENDING.STALLED]: function (s) { return '再等 ' + s + ' 秒没进度就停下' },
+  }
+
+  // 一个 tick 里只登记一条等待（决策核心保证），这里只负责把它翻成一句话
+  function pendingText(memory) {
+    const pending = memory && memory.pending
+    if (!pending) return ''
+    const template = PENDING_TEXT[pending.kind]
+    if (!template) return ''
+    const remain = Math.ceil((pending.dueAt - Date.now()) / 1000)
+    return template(remain > 0 ? remain : 0)
   }
 
   function createStatusBar() {
@@ -901,10 +976,12 @@
       return
     }
     observation.userStopped = controller.stoppedByUser
-    controller.progress = adapter.progressText()
 
     const result = decide(observation, controller.memory)
     controller.memory = result.memory
+    // 进度条读的是**判定之后**的记忆：这样倒计时不会慢一拍，
+    // 停下时 pending 已被清掉，所以停止文案后面不会挂一条倒计时
+    controller.progress = adapter.progressText(controller.memory)
 
     if (result.action.kind === ACTION.STOP) {
       controller.stopped = true
@@ -924,6 +1001,8 @@
     controller.stopped = true
     if (controller.timer) clearInterval(controller.timer)
     controller.timer = null
+    // 停下后的文案不带倒计时：上一次 tick 存下来的那条已经不作数了，重算一遍
+    controller.progress = adapter.progressText(null)
     controller.bar.render(REASON_TEXT.userStopped + '　' + controller.progress, true)
   }
 
@@ -956,6 +1035,7 @@
     initialMemory: initialMemory,
     ACTION: ACTION,
     STOP_REASON: STOP_REASON,
+    PENDING: PENDING,
     CONSTANTS: C,
   }
 

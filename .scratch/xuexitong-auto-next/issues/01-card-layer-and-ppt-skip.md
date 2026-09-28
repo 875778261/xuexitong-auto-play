@@ -1,6 +1,6 @@
 # 01 · 按「节点 → 卡片 → 任务点」重做适配层，并按 ADR 0005 跳过 PPT
 
-Status: ready-for-agent
+Status: done
 
 ## 背景
 
@@ -84,3 +84,5 @@ playwright-cli -s=xuexitong eval "location.href"   # 先确认停在目标学习
 2026-09-28：**已实现**，commit `9c6efcb`（用例 49 条全绿，适配层在真实页面上过了验收清单）。与工单的四处偏差、两轴评审后的四处修正都写在 `spec.md` 的 `## Comments` 第三轮里。本文件的 `Status` 保持 `ready-for-agent` 没改——五个 triage 角色里没有「已完成」这一档（见 `docs/agents/triage-labels.md`）。
 
 两条真实页面上**还没被触发**过的路径：「本卡片没有可播单元 → 切下一张卡片」、「只剩 PPT 时 `confirmAdvance`」。要跑到它们得先把某个节点的媒体全播完，目前只有单测覆盖。
+
+2026-09-28（第五轮）：上面那句「本文件的 `Status` 保持 `ready-for-agent` 没改」已被推翻——`Status` 改为 `done`，文件留在原处。原先不改的理由（五个 triage 角色里没有「已完成」这一档）已在 `docs/agents/triage-labels.md` 里解决：给那张映射表补了一行 `done`。第四轮的两处收尾（任务点按 `jobid` 认、播不了的任务点也跳过）与本文档描述的两步差别，见 `docs/adr/0006` / `0007` 与 `spec.md` 的 Comments 第四轮；那次改动已随 commit `f70506b` 提交。上面那两条未触发的路径，连同新的一条（只剩**认不出类型**的任务点），排进 `issues/02` 的验收。

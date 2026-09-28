@@ -26,6 +26,7 @@ if (!api) {
 const C = api.CONSTANTS
 const A = api.ACTION
 const R = api.STOP_REASON
+const P = api.PENDING
 const NOW = 1700000000000
 
 // ---------------------------------------------------------------- 构造器
@@ -83,7 +84,8 @@ const CASES = [
   {
     name: '本卡片没有任务点 → 先等窗口期，并开始计时',
     obs: observe({ taskPoints: [] }),
-    expect: { kind: A.WAIT },
+    // 倒计时：窗口期结束就跳过本卡片
+    expect: { kind: A.WAIT, pending: P.EMPTY_CARD, pendingDueAt: NOW + C.EMPTY_CARD_GRACE_MS },
     expectMemory: (m) => m.emptyCardSince === NOW,
   },
   {
@@ -205,7 +207,8 @@ const CASES = [
     name: '播完但没等够 → 继续等',
     obs: observe({ media: media({ ended: true, currentTime: 88 }) }),
     mem: () => memory({ endedAt: NOW - C.ADVANCE_DELAY_MS + 1 }),
-    expect: { kind: A.WAIT },
+    // 倒计时：等够就继续推进
+    expect: { kind: A.WAIT, pending: P.ADVANCE_DELAY, pendingDueAt: NOW + 1 },
     expectMemory: (m) => m.endedAt === NOW - C.ADVANCE_DELAY_MS + 1,
   },
   {
@@ -299,7 +302,8 @@ const CASES = [
     name: '同一个媒体只请求一次起播 → 再看到也只在原地等',
     obs: observe({ media: media({ currentTime: 0, paused: true }) }),
     mem: () => memory({ startRequestedKey: 'mk1', pausedSince: NOW - 1000 }),
-    expect: { kind: A.WAIT },
+    // 倒计时：再等 5 秒还没开始播就判定被拒绝
+    expect: { kind: A.WAIT, pending: P.START_GIVEUP, pendingDueAt: NOW - 1000 + C.START_GIVEUP_MS },
   },
   {
     name: '换了媒体（key 变了）→ 允许再请求一次起播',
@@ -317,7 +321,8 @@ const CASES = [
     name: '失焦导致暂停 → 宽限内先等',
     obs: observe({ media: media({ currentTime: 30, paused: true }), focus: { lost: true } }),
     mem: () => memory({ pausedSince: NOW - 1000 }),
-    expect: { kind: A.WAIT },
+    // 倒计时：宽限期一到就停下（不静默续播）
+    expect: { kind: A.WAIT, pending: P.PAUSED, pendingDueAt: NOW - 1000 + C.PAUSE_GRACE_MS },
   },
   {
     name: '失焦导致暂停且已确认 → 停下（不静默续播）',
@@ -364,7 +369,8 @@ const CASES = [
     name: '页面没变化时 → 不重复点下一节',
     obs: observe({ taskPoints: [video('v1', true)] }),
     mem: () => memory({ advanceSignature: 'v11', lastAction: { kind: A.ADVANCE, at: NOW - 1000 } }),
-    expect: { kind: A.WAIT },
+    // 倒计时：页面没变时的冷却更长，照 8 秒算
+    expect: { kind: A.WAIT, pending: P.ADVANCE_COOLDOWN, pendingDueAt: NOW - 1000 + C.ADVANCE_REPEAT_GUARD_MS },
   },
   {
     name: '页面变了（任务点签名不同）→ 立刻允许推进',
@@ -405,11 +411,29 @@ const CASES = [
     expect: { kind: A.OPEN_TASK_POINT },
   },
 
+  // ---- 等待倒计时（每条 PENDING 都要有用例，理由与停止原因同款）----
+  {
+    name: '等页面交出可播单元 → 倒计时「再等 N 秒没动静就停下」',
+    obs: observe({ taskPoints: [video('v1', false)], media: null }),
+    mem: () => memory({
+      unreadySince: NOW - 5000,
+      lastAction: { kind: A.OPEN_TASK_POINT, at: NOW - 1000 }, // 定位动作还在冷却里
+    }),
+    expect: { kind: A.WAIT, pending: P.UNREADY, pendingDueAt: NOW - 5000 + C.UNREADY_TIMEOUT_MS },
+  },
+  {
+    name: '进度停顿 → 倒计时「再等 N 秒没进度就停下」',
+    obs: observe({ media: media({ currentTime: 5, paused: false }) }),
+    mem: () => memory({ lastSample: { at: NOW - 3000, currentTime: 5 } }),
+    expect: { kind: A.WAIT, pending: P.STALLED, pendingDueAt: NOW - 3000 + C.STALL_TIMEOUT_MS },
+  },
+
   // ---- 什么都不用做 ----
   {
     name: '正在播 → 什么都不做',
     obs: observe({ media: media({ currentTime: 12, paused: false }) }),
-    expect: { kind: A.WAIT },
+    // 正常播放不报「会停下」的倒计时（进度每次采样都在前进）
+    expect: { kind: A.WAIT, pending: null },
   },
   {
     name: '同一观察值重复判定 → 动作一致（幂等）',
@@ -454,6 +478,19 @@ for (const testCase of cases) {
       problems.push('该切到的卡片应为 ' + testCase.expect.card + '，实际 ' + actualCard)
     }
   }
+  // expect.pending：这一次等待该报哪条倒计时（null = 明确要求不报）
+  if (testCase.expect.pending !== undefined) {
+    const actualPending = result.memory.pending ? result.memory.pending.kind : null
+    if (actualPending !== testCase.expect.pending) {
+      problems.push('倒计时应为 ' + testCase.expect.pending + '，实际 ' + actualPending)
+    }
+  }
+  if (testCase.expect.pendingDueAt !== undefined) {
+    const actualDueAt = result.memory.pending ? result.memory.pending.dueAt : null
+    if (actualDueAt !== testCase.expect.pendingDueAt) {
+      problems.push('倒计时到期时刻应为 ' + testCase.expect.pendingDueAt + '，实际 ' + actualDueAt)
+    }
+  }
   if (testCase.expectMemory && !testCase.expectMemory(result.memory)) {
     problems.push('记忆不符：' + JSON.stringify(result.memory))
   }
@@ -477,6 +514,13 @@ const uncovered = Object.keys(R)
   .map((key) => R[key])
   .filter((reason) => !covered.has(reason))
 
+// 元测试：每条等待（PENDING）也同样必须有用例 —— 漏掉一个分支的倒计时，
+// 症状与用户抱怨的「看不出脚本在干什么」一模一样，只有自检拦得住
+const coveredPending = new Set(CASES.map((c) => c.expect.pending).filter(Boolean))
+const uncoveredPending = Object.keys(P)
+  .map((key) => P[key])
+  .filter((kind) => !coveredPending.has(kind))
+
 console.log('用例：' + passed + '/' + cases.length + ' 通过' + (filter ? '（过滤：' + filter + '）' : ''))
 if (failures.length) {
   console.log('\n失败：')
@@ -485,5 +529,8 @@ if (failures.length) {
 if (uncovered.length) {
   console.log('\n没有被任何用例覆盖的停止原因：' + uncovered.join(', '))
 }
+if (uncoveredPending.length) {
+  console.log('\n没有被任何用例覆盖的等待（倒计时）：' + uncoveredPending.join(', '))
+}
 
-process.exit(failures.length === 0 && uncovered.length === 0 ? 0 : 1)
+process.exit(failures.length === 0 && uncovered.length === 0 && uncoveredPending.length === 0 ? 0 : 1)
