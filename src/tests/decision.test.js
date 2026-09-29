@@ -46,6 +46,14 @@ function media(over) {
   return Object.assign({ key: 'mk1', currentTime: 5, paused: false, ended: false, failed: false }, over)
 }
 
+// 章节树（ADR 0010）。unfinished = 树上有未完成计数（真实站点上是 input.jobUnfinishCount 在不在，
+// 它含 PPT 且**只有资料附件或空内容的节点没有**）；label 是节点短号，真实值形如 `4.1`。
+function treeNode(id, over) {
+  return Object.assign({ id: id, label: id, count: null, unfinished: false, current: false }, over)
+}
+function unfinished(id, over) { return treeNode(id, Object.assign({ count: 1, unfinished: true }, over)) }
+function tree(nodes) { return { nodes: nodes } }
+
 function observe(over) {
   return Object.assign({
     now: NOW,
@@ -53,12 +61,18 @@ function observe(over) {
     focus: { lost: false },
     page: page(),
     card: { active: 1, total: 1 }, // 默认「本节点只有一张卡片」，卡片层的用例自己指定
+    tree: null,                    // 默认「章节树不可用」= 回退到点下一节的路径
     taskPoints: [video('v1', false)],
     media: null,
   }, over)
 }
 
 function memory(over) { return Object.assign(api.initialMemory(), over) }
+
+// 章节树不可用时的回退路径：窗口期已经走完，脚本回到「点下一节」那一套（ADR 0010 保留的那条）
+function fallback(over) {
+  return Object.assign({ treeUnreadySince: NOW - C.TREE_READY_GRACE_MS }, over || null)
+}
 
 // 续播阶梯的账本（docs/adr/0009）：{ key, stage, attempts, dueAt, playingSince }
 //   stage 1 = 第一段（最多 5 次）；stage 2 = 重启之后（最多 3 次）
@@ -109,9 +123,9 @@ const CASES = [
     expectMemory: (m) => m.scan === null,
   },
   {
-    name: '本卡片没有任务点、窗口期过了、本节点只有这一张卡片 → 推进（资料展示节点）',
+    name: '（回退路径）本卡片没有任务点、窗口期过了、本节点只有这一张卡片 → 点下一节（资料展示节点）',
     obs: observe({ taskPoints: [] }),
-    mem: () => memory({ emptyCardSince: NOW - C.EMPTY_CARD_GRACE_MS }),
+    mem: () => memory(fallback({ emptyCardSince: NOW - C.EMPTY_CARD_GRACE_MS })),
     expect: { kind: A.ADVANCE },
   },
   {
@@ -121,12 +135,12 @@ const CASES = [
     expect: { kind: A.OPEN_TASK_POINT, card: 2 },
   },
   {
-    name: '本卡片没有任务点、窗口期过了、卡片已扫遍 → 推进',
+    name: '（回退路径）本卡片没有任务点、窗口期过了、卡片已扫遍 → 点下一节',
     obs: observe({ taskPoints: [], card: { active: 2, total: 2 } }),
-    mem: () => memory({
+    mem: () => memory(fallback({
       emptyCardSince: NOW - C.EMPTY_CARD_GRACE_MS,
       scan: { total: 2, visited: [1], sawUnfinished: false },
-    }),
+    })),
     expect: { kind: A.ADVANCE },
   },
   {
@@ -137,8 +151,9 @@ const CASES = [
 
   // ---- 认不出的任务点类型（ADR 0007：与 PPT 同档 —— 脚本播不了，跳过）----
   {
-    name: '只剩未完成的认不出类型、本节点只有一张卡片 → 推进',
+    name: '（回退路径）只剩未完成的认不出类型、本节点只有一张卡片 → 点下一节',
     obs: observe({ taskPoints: [{ id: 'u1', kind: 'unknown', completed: false }] }),
+    mem: () => memory(fallback()),
     expect: { kind: A.ADVANCE },
   },
   {
@@ -233,9 +248,9 @@ const CASES = [
     expect: { kind: A.OPEN_TASK_POINT },
   },
   {
-    name: '播完且等够了、本卡片已无未完成可播 → 点下一节',
+    name: '（回退路径）播完且等够了、本卡片已无未完成可播 → 点下一节',
     obs: observe({ taskPoints: [video('v1', true)], media: media({ ended: true, currentTime: 88 }) }),
-    mem: () => memory({ endedAt: NOW - C.ADVANCE_DELAY_MS }),
+    mem: () => memory(fallback({ endedAt: NOW - C.ADVANCE_DELAY_MS })),
     expect: { kind: A.ADVANCE },
   },
 
@@ -264,9 +279,9 @@ const CASES = [
     expectMemory: (m) => m.scan === null,
   },
   {
-    name: '最后一张卡片也扫过、只剩别的卡片里的 PPT → 点下一节',
+    name: '（回退路径）最后一张卡片也扫过、只剩别的卡片里的 PPT → 点下一节',
     obs: observe({ taskPoints: [video('v1', true)], card: { active: 2, total: 2 }, media: null }),
-    mem: () => memory({ scan: { total: 2, visited: [1], sawUnfinished: true } }),
+    mem: () => memory(fallback({ scan: { total: 2, visited: [1], sawUnfinished: true } })),
     expect: { kind: A.ADVANCE },
   },
   {
@@ -433,13 +448,15 @@ const CASES = [
       unreadySince: NOW - 10000,
       lastAction: { kind: A.ADVANCE, at: NOW - 1000 },
       advanceSignature: 'v11',
+      jumpRequested: { id: 'n9', at: NOW - 1000 },
     }),
     // 重启那一刻先再播一次，并把第二段第 1 次排在一个间隔之后
     expect: { kind: A.AUTO_RESUME, pending: P.AUTO_RESUME_AFTER_RESTART, pendingDueAt: NOW + C.RESUME_INTERVAL_MS },
     expectMemory: (m) => m.resume.stage === 2 && m.resume.attempts === 0 && m.resume.key === 'mk1' &&
       m.unreadySince === null &&
       !!m.lastAction && m.lastAction.kind === A.ADVANCE &&
-      m.advanceSignature === 'v11',
+      m.advanceSignature === 'v11' &&
+      !!m.jumpRequested && m.jumpRequested.id === 'n9',
   },
 
   // 第二段：重启之后再试 RESTART_MAX_ATTEMPTS 次，然后才真正停下
@@ -469,48 +486,194 @@ const CASES = [
     expect: { kind: A.STOP, reason: R.FOCUS_LOST_PAUSE },
   },
 
-  // ---- 推进与结束 ----
+  // ---- 回退路径的推进与结束（章节树不可用；ADR 0010 只把它留作回退）----
   {
-    name: '没有可播任务点、还有下一节 → 推进',
+    name: '（回退路径）没有可播任务点、还有下一节 → 点下一节',
     obs: observe({ taskPoints: [video('v1', true), ppt('p1', true)] }),
+    mem: () => memory(fallback()),
     expect: { kind: A.ADVANCE },
   },
   {
-    name: '只剩 PPT 未完成、还没弹确认框 → 直接推进',
+    name: '（回退路径）只剩 PPT 未完成、还没弹确认框 → 直接点下一节',
     obs: observe({ taskPoints: [video('v1', true), ppt('p1', false)] }),
+    mem: () => memory(fallback()),
     expect: { kind: A.ADVANCE },
   },
   {
-    name: '只剩 PPT 未完成、页面已到末尾 → 判定整门课跑完',
+    name: '（回退路径）只剩 PPT 未完成、页面已到末尾 → 判定整门课跑完',
     obs: observe({ taskPoints: [ppt('p1', false)], page: page({ hasNext: false }) }),
+    mem: () => memory(fallback()),
     expect: { kind: A.STOP, reason: R.COURSE_COMPLETED },
   },
   {
-    name: '全部完成、还有下一节 → 推进到下一节点',
+    name: '（回退路径）全部完成、还有下一节 → 点下一节',
     obs: observe({ taskPoints: [video('v1', true), audio('a1', true)] }),
+    mem: () => memory(fallback()),
     expect: { kind: A.ADVANCE },
   },
   {
-    name: '页面没变化时 → 不重复点下一节',
+    name: '（回退路径）页面没变化时 → 不重复点下一节',
     obs: observe({ taskPoints: [video('v1', true)] }),
-    mem: () => memory({ advanceSignature: 'v11', lastAction: { kind: A.ADVANCE, at: NOW - 1000 } }),
+    mem: () => memory(fallback({ advanceSignature: 'v11', lastAction: { kind: A.ADVANCE, at: NOW - 1000 } })),
     // 倒计时：页面没变时的冷却更长，照 8 秒算
     expect: { kind: A.WAIT, pending: P.ADVANCE_COOLDOWN, pendingDueAt: NOW - 1000 + C.ADVANCE_REPEAT_GUARD_MS },
   },
   {
-    name: '页面变了（任务点签名不同）→ 立刻允许推进',
+    name: '（回退路径）页面变了（任务点签名不同）→ 立刻允许推进',
     obs: observe({ taskPoints: [video('v1', true)] }),
-    mem: () => memory({ advanceSignature: 'v10', lastAction: { kind: A.ADVANCE, at: NOW - 1000 } }),
+    mem: () => memory(fallback({ advanceSignature: 'v10', lastAction: { kind: A.ADVANCE, at: NOW - 1000 } })),
     expect: { kind: A.ADVANCE },
   },
   {
-    name: '页面迟迟没反应且等够了 → 允许再点一次下一节',
+    name: '（回退路径）页面迟迟没反应且等够了 → 允许再点一次下一节',
     obs: observe({ taskPoints: [video('v1', true)] }),
-    mem: () => memory({
+    mem: () => memory(fallback({
       advanceSignature: 'v11',
       lastAction: { kind: A.ADVANCE, at: NOW - C.ADVANCE_REPEAT_GUARD_MS },
-    }),
+    })),
     expect: { kind: A.ADVANCE },
+  },
+
+  // ---- 章节树：只向前跳到「当前节点之后第一个未完成节点」（docs/adr/0010）----
+  //      这一组的场面就是用户报的那一个：打开一个早已做完的节点，应当**只跳一次**就到位
+  {
+    name: '章节树：当前节点已完成、后面还有未完成节点 → 跳到它',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      tree: tree([treeNode('n1', { current: true }), treeNode('n1b'), unfinished('n2')]),
+    }),
+    expect: { kind: A.JUMP_NODE, nodeId: 'n2' },
+    expectMemory: (m) => !!m.jumpRequested && m.jumpRequested.id === 'n2' && m.jumpRequested.at === NOW,
+  },
+  {
+    name: '章节树：本节点只剩已完成的任务点 → 不去按它的播放键，直接跳走',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      media: media({ currentTime: 0, paused: true }),
+      tree: tree([treeNode('n1', { current: true }), unfinished('n2')]),
+    }),
+    expect: { kind: A.JUMP_NODE, nodeId: 'n2' },
+  },
+  {
+    name: '章节树：当前节点自己还有可播的未完成任务点 → 就地播，不跳',
+    obs: observe({
+      taskPoints: [video('v1', false)],
+      tree: tree([unfinished('n1', { current: true }), unfinished('n2')]),
+    }),
+    expect: { kind: A.OPEN_TASK_POINT },
+    expectMemory: (m) => m.jumpRequested === null,
+  },
+  {
+    name: '章节树说当前节点还有未完成、脚本却一个未完成任务点都没采到 → 停下',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      tree: tree([unfinished('n1', { current: true }), unfinished('n2')]),
+    }),
+    expect: { kind: A.STOP, reason: R.TREE_UNFINISHED_NOT_FOUND },
+  },
+  {
+    name: '章节树说还有未完成、但采到的都是脚本播不了的（PPT）→ 允许跳过',
+    obs: observe({
+      taskPoints: [video('v1', true), ppt('p1', false)],
+      tree: tree([unfinished('n1', { current: true }), unfinished('n2')]),
+    }),
+    expect: { kind: A.JUMP_NODE, nodeId: 'n2' },
+  },
+  {
+    name: '章节树：当前节点之后没有未完成节点了 → 判定结束',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      tree: tree([treeNode('n1', { current: true }), treeNode('n2')]),
+    }),
+    expect: { kind: A.STOP, reason: R.COURSE_COMPLETED },
+  },
+  {
+    name: '章节树：未完成的节点在当前节点之前 → 不回头，判定结束',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      tree: tree([unfinished('n0'), treeNode('n1', { current: true })]),
+    }),
+    expect: { kind: A.STOP, reason: R.COURSE_COMPLETED },
+  },
+  {
+    name: '章节树认不出当前节点 → 当树不可用，先等窗口期',
+    obs: observe({ taskPoints: [video('v1', true)], tree: tree([unfinished('n2')]) }),
+    expect: { kind: A.WAIT, pending: P.TREE_NOT_READY },
+    expectMemory: (m) => m.treeUnreadySince === NOW,
+  },
+  {
+    name: '章节树拿不到 → 先等窗口期，到点才改用「下一节」',
+    obs: observe({ taskPoints: [video('v1', true)] }),
+    // 倒计时：窗口期结束就改用下一节推进
+    expect: { kind: A.WAIT, pending: P.TREE_NOT_READY, pendingDueAt: NOW + C.TREE_READY_GRACE_MS },
+    expectMemory: (m) => m.treeUnreadySince === NOW,
+  },
+  {
+    name: '章节树拿不到、窗口期还没走完 → 继续等，不重置计时',
+    obs: observe({ taskPoints: [video('v1', true)] }),
+    mem: () => memory({ treeUnreadySince: NOW - C.TREE_READY_GRACE_MS + 1 }),
+    expect: { kind: A.WAIT, pending: P.TREE_NOT_READY },
+    expectMemory: (m) => m.treeUnreadySince === NOW - C.TREE_READY_GRACE_MS + 1,
+  },
+  {
+    name: '同一个目标只跳一次：还没到位时不重复点，改报「再等 N 秒没动静就停下」',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      tree: tree([treeNode('n1', { current: true }), unfinished('n2')]),
+    }),
+    mem: () => memory({ jumpRequested: { id: 'n2', at: NOW - 2000 } }),
+    expect: { kind: A.WAIT, pending: P.UNREADY, pendingDueAt: NOW - 2000 + C.UNREADY_TIMEOUT_MS },
+    expectMemory: (m) => !!m.jumpRequested && m.jumpRequested.id === 'n2',
+  },
+  {
+    name: '跳节点之后当前节点一直没变成目标 → 到点停下（沿用「一直没找到」那一条）',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      tree: tree([treeNode('n1', { current: true }), unfinished('n2')]),
+    }),
+    mem: () => memory({ jumpRequested: { id: 'n2', at: NOW - C.UNREADY_TIMEOUT_MS } }),
+    expect: { kind: A.STOP, reason: R.MEDIA_NOT_FOUND },
+  },
+  {
+    name: '跳节点已经到位（当前节点就是目标）→ 把那一笔划掉，接着跳下一个',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      tree: tree([treeNode('n1', { current: true }), unfinished('n2')]),
+    }),
+    mem: () => memory({ jumpRequested: { id: 'n1', at: NOW - 2000 } }),
+    expect: { kind: A.JUMP_NODE, nodeId: 'n2' },
+    expectMemory: (m) => !!m.jumpRequested && m.jumpRequested.id === 'n2',
+  },
+  {
+    name: '刚跳过、还在冷却里 → 不重复跳（报「N 秒后重试跳转」）',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      tree: tree([treeNode('n1', { current: true }), unfinished('n2')]),
+    }),
+    mem: () => memory({ lastAction: { kind: A.JUMP_NODE, at: NOW - 1000 } }),
+    expect: { kind: A.WAIT, pending: P.ADVANCE_COOLDOWN, pendingDueAt: NOW - 1000 + C.ACTION_COOLDOWN_MS },
+  },
+  {
+    name: '播完等一段、下一步确实要跳节点 → 倒计时带上目标短号',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      media: media({ ended: true, currentTime: 88 }),
+      tree: tree([treeNode('n1', { current: true }), unfinished('n2', { label: '4.1' })]),
+    }),
+    mem: () => memory({ endedAt: NOW - C.ADVANCE_DELAY_MS + 1 }),
+    expect: { kind: A.WAIT, pending: P.ADVANCE_DELAY, pendingDueAt: NOW + 1 },
+    expectMemory: (m) => !!m.pending && m.pending.label === '4.1',
+  },
+  {
+    name: '播完等一段、后面没有要跳的节点 → 倒计时不带短号',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      media: media({ ended: true, currentTime: 88 }),
+      tree: tree([treeNode('n1', { current: true })]),
+    }),
+    mem: () => memory({ endedAt: NOW - C.ADVANCE_DELAY_MS + 1 }),
+    expect: { kind: A.WAIT, pending: P.ADVANCE_DELAY },
+    expectMemory: (m) => !!m.pending && m.pending.label === null,
   },
 
   // ---- 打开任务点 ----

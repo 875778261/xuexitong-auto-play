@@ -10,9 +10,11 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-// 行为边界见 docs/adr/0002（只做如实完播后的推进）、docs/adr/0005 与 0007（脚本播不了的任务点一律跳过，
-// 平台弹确认框时代为确认）、docs/adr/0006（任务点按 jobid 认；只剩资料附件的节点直接推进，不等也不停）、
-// docs/adr/0009（媒体没在播时不再直接停下：自动续播 5 次 → 重启一次脚本 → 再 3 次，才真正停下）。
+// 行为边界见 docs/adr/0002（只做如实完播后的推进）、docs/adr/0005 与 0007（脚本播不了的任务点一律跳过）、
+// docs/adr/0006（任务点按 jobid 认；只剩资料附件的节点直接推进，不等也不停）、
+// docs/adr/0009（媒体没在播时不再直接停下：自动续播 5 次 → 重启一次脚本 → 再 3 次，才真正停下）、
+// docs/adr/0010（推进 = 从章节树直接跳到当前节点之后的第一个未完成节点，只向前；
+//   平台那张「还有任务点未完成」确认框因此只在章节树不可用的回退路径上才会遇到）。
 // 设计依据见 .scratch/xuexitong-auto-next/spec.md；层级是「节点 → 卡片 → 任务点」，见 CONTEXT.md。
 //
 // 本文件分三层：
@@ -36,6 +38,7 @@
     STALL_TIMEOUT_MS: 20000,          // currentTime 这么久不前进即判定卡住
     UNREADY_TIMEOUT_MS: 30000,        // 页面给不出媒体（或卡片层认不出来），等这么久才放弃
     EMPTY_CARD_GRACE_MS: 3000,        // 本卡片一个任务点都没有时，先按这么久当「还没渲染出来」
+    TREE_READY_GRACE_MS: 10000,       // 章节树还没铺好时先等这么久，仍拿不到才回退到「下一节」
     ACTION_COOLDOWN_MS: 4000,         // 同类动作的最小重复间隔
     ADVANCE_REPEAT_GUARD_MS: 8000,    // 页面没变化时，不重复点「下一节」
     TASK_POINT_CACHE_MS: 3000,        // 任务点元素的重扫间隔
@@ -49,8 +52,9 @@
     START: 'start',                   // 调 media.play()
     AUTO_RESUME: 'autoResume',        // 媒体没在播：再按一次播放（续播阶梯，见 ADR 0009）
     OPEN_TASK_POINT: 'openTaskPoint', // 定位到第一个未完成的可播单元（本卡片内找不到就切下一张卡片）
-    ADVANCE: 'advance',               // 点「下一节」
-    CONFIRM_ADVANCE: 'confirmAdvance',// 点确认框里的「下一节」
+    JUMP_NODE: 'jumpNode',            // 从章节树跳到指定的节点（只向前，见 ADR 0010）
+    ADVANCE: 'advance',               // 点「下一节」（只在章节树不可用时）
+    CONFIRM_ADVANCE: 'confirmAdvance',// 点确认框里的「下一节」（同上）
     STOP: 'stop',
   }
 
@@ -58,7 +62,8 @@
     USER_STOPPED: 'userStopped',
     LOGIN_RISK_CONTROL: 'loginRiskControl',
     FACE_CAPTURE_COURSE: 'faceCaptureCourse',
-    MEDIA_NOT_FOUND: 'mediaNotFound',
+    MEDIA_NOT_FOUND: 'mediaNotFound',        // 也管「跳节点没生效」：那 30 秒内当前节点没变成目标
+    TREE_UNFINISHED_NOT_FOUND: 'treeUnfinishedNotFound', // 树上说本节点还有未完成，脚本却一个未完成任务点都没采到
     MEDIA_INCOMPLETE_CONFIRM: 'mediaIncompleteConfirm',
     DIALOG_WITHOUT_UNFINISHED: 'dialogWithoutUnfinished',
     MEDIA_LOAD_FAILED: 'mediaLoadFailed',
@@ -73,6 +78,7 @@
   // ⚠️ 同款纪律：新增一条就补一条用例；删掉一条就连它的倒计时文案一起删。
   const PENDING = {
     EMPTY_CARD: 'emptyCard',             // 本卡片 0 个任务点，等它渲染出来
+    TREE_NOT_READY: 'treeNotReady',      // 章节树还没铺好：等一个窗口期，到点就改用「下一节」
     ADVANCE_DELAY: 'advanceDelay',       // 媒体播完后的固定延迟
     ADVANCE_COOLDOWN: 'advanceCooldown', // 刚推进过，等同类动作的冷却
     UNREADY: 'unready',                  // 等页面交出可播单元，等不到就停下
@@ -101,6 +107,9 @@
   //       faceCaptureRequired: boolean   该课程是否启用人脸抓拍
   //     }
   //     card: { active, total }        当前节点渲染的是第几张卡片、共几张（只有 active 那张的内容在 DOM 里）
+  //     tree: null | { nodes: [{ id, label, count, unfinished, current }] }
+  //       章节树（ADR 0010）。null = 树不可用（容器缺失 / 没有节节点 / 认不出当前节点）。
+  //       label 是节点短号（4.1 这种），供状态条拼文案；unfinished = 树上有未完成计数；current = 当前节点
   //     taskPoints: [{ id, kind, completed }]  **当前卡片**的任务点，按页面顺序；kind ∈ KIND
   //     media: null | { key, currentTime, paused, ended, failed }
   //       key —— 这一个媒体元素的稳定标识，用来判断「起播是否已经请求过」
@@ -115,9 +124,11 @@
       endedAt: null,           // 当前媒体播完的时刻
       unreadySince: null,      // 页面连续给不出「媒体」（或卡片层认不出来）的起点
       emptyCardSince: null,    // 本卡片连续「一个任务点都没有」的起点
+      treeUnreadySince: null,  // 章节树连续拿不到的起点（到点就回退到「下一节」，ADR 0010）
       lastAction: null,        // { kind, at } 上次发出的动作
       advanceSignature: null,  // 上次点「下一节」时看到的任务点签名
       startRequestedKey: null, // 已经替哪个媒体请求过起播（spec：起播不重试）
+      jumpRequested: null,     // { id, at } 已经请求跳过哪个节点 —— 同一个目标只跳一次（ADR 0010）
       // 本轮续播阶梯的账本，见 docs/adr/0009：
       //   { key, stage, attempts, dueAt, playingSince }
       //   stage 1 = 第一段（最多 RESUME_MAX_ATTEMPTS 次）；stage 2 = 重启之后（最多 RESTART_MAX_ATTEMPTS 次）
@@ -179,7 +190,7 @@
     const window = guardMs === undefined ? C.ACTION_COOLDOWN_MS : guardMs
     const last = mem.lastAction
     if (last && last.kind === kind && now - last.at < window) {
-      const advancing = kind === ACTION.ADVANCE || kind === ACTION.CONFIRM_ADVANCE
+      const advancing = kind === ACTION.ADVANCE || kind === ACTION.CONFIRM_ADVANCE || kind === ACTION.JUMP_NODE
       return advancing ? wait(mem, pendingOf(PENDING.ADVANCE_COOLDOWN, last.at + window)) : wait(mem)
     }
     return {
@@ -191,6 +202,40 @@
   // 「可播的未完成任务点」—— 决策核心与适配层共用同一个判据，别各写一份
   function isPlayableUnfinished(t) {
     return !t.completed && (t.kind === KIND.VIDEO || t.kind === KIND.AUDIO)
+  }
+
+  // 章节树的「可用」判据：要有节点，而且要认得出当前节点 —— 认不出来就判不了「它之后」（ADR 0010）。
+  // 不可用一律折成 null，调用方据此决定「先等它铺好」还是「回退到点下一节」。
+  function usableTree(observation) {
+    const tree = observation.tree
+    if (!tree || !tree.nodes || tree.nodes.length === 0) return null
+    for (let i = 0; i < tree.nodes.length; i++) {
+      if (tree.nodes[i].current) return tree
+    }
+    return null
+  }
+
+  function currentNodeOf(tree) {
+    for (let i = 0; i < tree.nodes.length; i++) {
+      if (tree.nodes[i].current) return tree.nodes[i]
+    }
+    return null
+  }
+
+  // 只向前：当前节点**之后**第一个「树上带未完成计数」的节点。
+  // 判据是 unfinished（= 树上有那个 jobUnfinishCount 元素）而不是「没有 已完成 标记」——
+  // 只有资料附件或空内容的节点两个标记都没有，用后者会把它们也当成候选（ADR 0010）。
+  function nextUnfinishedAfter(tree) {
+    const nodes = tree.nodes
+    let pastCurrent = false
+    for (let i = 0; i < nodes.length; i++) {
+      if (nodes[i].current) {
+        pastCurrent = true
+        continue
+      }
+      if (pastCurrent && nodes[i].unfinished) return nodes[i]
+    }
+    return null
   }
 
   // 任务点签名：用来区分「点了没反应」和「已经翻到别处了」
@@ -265,6 +310,8 @@
     const page = observation.page || {}
     const focus = observation.focus || {}
     const card = observation.card || { active: 1, total: 1 }
+    // 章节树（ADR 0010）：能拿到就用它选下一个要跳过去的节点，拿不到就等 / 回退
+    const tree = usableTree(observation)
 
     // 1. 用户按了「停止」
     if (observation.userStopped) return stop(mem0, STOP_REASON.USER_STOPPED)
@@ -290,10 +337,21 @@
     mem = Object.assign({}, mem, { emptyCardSince })
     const scannedAll = scanCoversNode(mem, card)
 
+    // 5b. 上一次请求的跳转已经到位（当前节点就是它）→ 把那一笔划掉，下一个目标才跳得动。
+    //     判据是「当前节点有没有变成目标」，不是「点了没反应」（ADR 0010）
+    if (mem.jumpRequested && tree) {
+      const arrived = currentNodeOf(tree)
+      if (arrived && arrived.id === mem.jumpRequested.id) {
+        mem = Object.assign({}, mem, { jumpRequested: null })
+      }
+    }
+
     // 6. 未完成确认框（ADR 0002 / 0005 / 0007）：扫遍全部卡片、未完成的全是**脚本播不了的**
     //    （PPT 或认不出类型），才替用户点确认。
     //    ⚠️ 这一步必须排在「本卡片空就推进」前面：平台说还有没做的、脚本却一个未完成都没看见时，
-    //    这里是唯一会停下来的地方（ADR 0006 的安全网就是这张确认框，不是脚本自己造的判据）
+    //    这里是唯一会停下来的地方。
+    //    ⚠️ 这张确认框只在**章节树不可用的回退路径**上会遇到（它由点「下一节」触发，见 ADR 0010）；
+    //    树可用时，同一个安全网由 stop 那条 treeUnfinishedNotFound 承担。
     if (page.confirmDialogVisible) {
       if (scannedAll && playable.length === 0) {
         // 扫遍了却一个未完成任务点都没看到，平台却弹了确认框 —— 两边有一边错了，停下让人看
@@ -332,6 +390,12 @@
       }
     }
 
+    // 8b. 本节点已经没有可播的未完成任务点了 → 当场把注意力挪走（换卡片 / 跳节点），
+    //     别再去按一个**已完成**任务点的播放键 —— 旧行为在「打开一个早已做完的节点」时会先起播一下
+    //     它的媒体再推进（ADR 0010 要的正是这段浪费）。
+    //     ⚠️ 排在「播完固定等一段」前面时会把那 15 秒吞掉，所以 ended 的那一条要留出口子。
+    if (playable.length === 0 && !(media && media.ended)) return locateOrAdvance()
+
     // 9. 媒体加载失败 → 先走续播阶梯（原先立刻停；网络抖动时 play() 会重跑资源选择，可能救回来）
     if (media && media.failed) return resumeOrStop(STOP_REASON.MEDIA_LOAD_FAILED)
 
@@ -340,7 +404,10 @@
       const endedAt = since(mem.endedAt, now)
       mem = Object.assign({}, mem, { endedAt, resume: null })
       if (now - endedAt < C.ADVANCE_DELAY_MS) {
-        return wait(mem, pendingOf(PENDING.ADVANCE_DELAY, endedAt + C.ADVANCE_DELAY_MS))
+        // 到期要跳节点时就把目标短号一并交给状态条（「N 秒后跳到 4.2」）；否则只说「继续推进」
+        return wait(mem, pendingOf(PENDING.ADVANCE_DELAY, endedAt + C.ADVANCE_DELAY_MS, {
+          label: pendingJumpLabel(),
+        }))
       }
       return locateOrAdvance()
     }
@@ -415,11 +482,12 @@
       // 名额用尽且已到点：第一段 → 重启一次脚本；第二段 → 真正停下
       if (resume.stage === 1) {
         // 重启 = 与「继续」按钮同一套口径：重置全部时间基准（重新扫任务点、重新找媒体），
-        // 但**保住推进的记忆**（lastAction / advanceSignature 丢了会重复点「下一节」），
-        // 并记住「已经重启过一次」这件事 —— 否则重启后又获得 5 次，就无限了
+        // 但**保住推进的记忆**（lastAction / advanceSignature / jumpRequested 丢了会重复点
+        // 「下一节」或重复跳同一个节点），并记住「已经重启过一次」这件事 —— 否则重启后又获得 5 次
         const fresh = initialMemory()
         fresh.lastAction = mem.lastAction
         fresh.advanceSignature = mem.advanceSignature
+        fresh.jumpRequested = mem.jumpRequested
         fresh.resume = { key: key, stage: 2, attempts: 0, dueAt: now + C.RESUME_INTERVAL_MS, playingSince: null }
         return {
           action: { kind: ACTION.AUTO_RESUME },
@@ -430,12 +498,70 @@
     }
 
     // 「推进」的全部出口：先在本卡片内定位；本卡片没有可播单元就切到还没找过的卡片；
-    // 全部卡片都找过、确实没有可播单元了，才去点「下一节」。
+    // 全部卡片都找过、确实没有可播单元了，才真的离开本节点。
     function locateOrAdvance() {
       if (playable.length > 0) return waitForPlayable(null)
       if (!scannedAll) return waitForPlayable({ card: nextCardToVisit(mem, card) })
+      return moveOn()
+    }
+
+    // 离开本节点（ADR 0010）：能拿到章节树就跳到「当前节点之后第一个未完成节点」；
+    // 拿不到就先等它铺好（窗口期），仍拿不到才回退到旧的「点下一节」。
+    function moveOn() {
+      if (tree) {
+        mem = Object.assign({}, mem, { treeUnreadySince: null })
+        if (!mayLeaveCurrentNode()) return stop(mem, STOP_REASON.TREE_UNFINISHED_NOT_FOUND)
+        const target = nextUnfinishedAfter(tree)
+        if (!target) return stop(mem, STOP_REASON.COURSE_COMPLETED)
+        return jumpTo(target)
+      }
+      const treeUnreadySince = since(mem.treeUnreadySince, now)
+      mem = Object.assign({}, mem, { treeUnreadySince })
+      if (now - treeUnreadySince < C.TREE_READY_GRACE_MS) {
+        return wait(mem, pendingOf(PENDING.TREE_NOT_READY, treeUnreadySince + C.TREE_READY_GRACE_MS))
+      }
       if (page.hasNext === false) return stop(mem, STOP_REASON.COURSE_COMPLETED)
       return advance(taskPoints, mem, now)
+    }
+
+    // 安全网（ADR 0010）：树跳转绕开了平台那张「还有任务点未完成」确认框，所以「能不能走」
+    // 改由树自己回答 —— 树上说本节点还有未完成时，脚本必须解释得清：
+    // 「看到过未完成任务点、但都是脚本播不了的」（承 ADR 0007）才允许走；
+    // 一个未完成任务点都没看到，说明两边必有一边错了（多半是适配层漏判），停下让人看。
+    function mayLeaveCurrentNode() {
+      const current = currentNodeOf(tree)
+      if (!current || !current.unfinished) return true
+      return !!(mem.scan && mem.scan.sawUnfinished)
+    }
+
+    // 跳节点：同一个目标只跳一次（与 startRequestedKey 同款），
+    // 失败判据是**当前节点有没有变成目标**，不是「点了没反应」—— 所以必须记下目标与时刻。
+    function jumpTo(target) {
+      const requested = mem.jumpRequested
+      if (requested && requested.id === target.id) {
+        if (now - requested.at >= C.UNREADY_TIMEOUT_MS) return stop(mem, STOP_REASON.MEDIA_NOT_FOUND)
+        return wait(mem, pendingOf(PENDING.UNREADY, requested.at + C.UNREADY_TIMEOUT_MS))
+      }
+      const result = throttledAction(ACTION.JUMP_NODE, mem, now, undefined, { nodeId: target.id })
+      if (result.action.kind !== ACTION.JUMP_NODE) return result
+      // 换了节点：所有「等页面」的计时与采样都从头来
+      return {
+        action: result.action,
+        memory: Object.assign({}, result.memory, {
+          jumpRequested: { id: target.id, at: now },
+          lastSample: null,
+          unreadySince: null,
+          emptyCardSince: null,
+        }),
+      }
+    }
+
+    // 这一次「播完固定等一段」到期之后要跳哪个节点？只用来给状态条拼短号（ADR 0010 Q9）
+    function pendingJumpLabel() {
+      if (!tree || playable.length > 0 || !scannedAll) return null
+      if (!mayLeaveCurrentNode()) return null
+      const target = nextUnfinishedAfter(tree)
+      return target ? target.label : null
     }
 
     // 还在等页面把可播单元交出来（媒体还没出现，或卡片还没切过去）——
@@ -468,7 +594,15 @@
     cardSwitcher: 'ul.prev_ul > li',            // 卡片切换器（在主文档里），活动态带 active 类
     cardId: /^dct\d+$/,                         // 事实上的卡片是 li#dctN
     cardActiveClass: 'active',
-    nodeUnfinishedInput: '.posCatalog_active input.jobUnfinishCount', // 平台自己的「本节点待完成数」
+    // 章节树（学习页主文档里就有整棵，见 docs/sites/xuexitong.md § 章节树与跳节点）：
+    // 节 = `#coursetree` 下 id 形如 `cur<chapterId>` 的 posCatalog_select；「章」是同名 div 但没有 cur 前缀
+    treeRoot: '#coursetree',
+    treeNode: 'div.posCatalog_select',
+    treeNodeId: /^cur\d+$/,
+    treeActiveClass: 'posCatalog_active',        // 当前节点，全树唯一
+    treeLabel: 'em.posCatalog_sbar',             // 节点短号（4.1 这种，是 em 不是 span —— 真机上验过）
+    treeJumpEntry: 'span.posCatalog_name[onclick*="getTeacherAjax"]', // 站点自己的跳节点入口
+    unfinishedCountInput: 'input.jobUnfinishCount', // 未完成数（含 PPT）；不渲染就是「本节点没未完成的」
     nextEntry: /下一节/,
     nextOnclick: /PCount\.next/,
     confirmText: /还有任务点未完成/,
@@ -721,15 +855,79 @@
     if (target) bringIntoView(target.el)
   }
 
-  // 平台自己在章节树上给的「本节点待完成数」（含 PPT），只用来展示
-  function readNodeUnfinished() {
+  // 章节树：拿整棵（见 docs/sites/xuexitong.md § 章节树与跳节点）。
+  // 只返回纯数据 —— 元素不出这一层。拿不到（容器没了 / 一个节节点都没有）就返回 null，
+  // 决策核心据此决定「先等它铺好」还是「回退到点下一节」。
+  // 已完成（span.icon_Completed）与未完成（input.jobUnfinishCount）是**互斥**的两个标记，
+  // 只有资料附件或空内容的节点两个都没有 —— 所以判据取后者（ADR 0010）。
+  function readTree() {
+    let items
     try {
-      const input = document.querySelector(ADAPTER_FACTS.nodeUnfinishedInput)
+      items = document.querySelectorAll(ADAPTER_FACTS.treeRoot + ' ' + ADAPTER_FACTS.treeNode)
+    } catch (e) {
+      return null
+    }
+    const nodes = []
+    for (let i = 0; i < items.length; i++) {
+      const el = items[i]
+      if (!ADAPTER_FACTS.treeNodeId.test(el.id || '')) continue
+      const countInput = el.querySelector(ADAPTER_FACTS.unfinishedCountInput)
+      const labelEl = el.querySelector(ADAPTER_FACTS.treeLabel)
+      const count = countInput ? Number(countInput.value) : NaN
+      nodes.push({
+        id: el.id.replace(/^cur/, ''),
+        label: labelEl ? (labelEl.textContent || '').replace(/\s+/g, '') : el.id.replace(/^cur/, ''),
+        count: isFinite(count) ? count : null,
+        unfinished: !!countInput,
+        current: el.classList.contains(ADAPTER_FACTS.treeActiveClass),
+      })
+    }
+    return nodes.length > 0 ? { nodes: nodes } : null
+  }
+
+  // 「跳到指定节点」：点它自己的入口（`span.posCatalog_name` 的 onclick = `getTeacherAjax(...)`）。
+  // 那是站点自己的跳转路径（局部刷新、脚本实例存活，见 docs/sites），脚本不自己拼 URL、不碰 location。
+  function jumpToNode(nodeId) {
+    if (!nodeId) return
+    const node = document.getElementById('cur' + nodeId)
+    if (!node) return
+    const entry = node.querySelector(ADAPTER_FACTS.treeJumpEntry)
+    if (!entry || !entry.click) return
+    entry.click()
+    taskPointCache = { at: 0, items: [] } // #mainid 要换了，缓存的元素引用立刻作废
+  }
+
+  // 平台自己的「本节点待完成数」（含 PPT）。树拿不到时退回按类名找 —— 那条老路径只在
+  // 回退到「下一节」时才用得上（ADR 0010）。
+  function readNodeUnfinished(tree) {
+    if (tree) {
+      const current = tree.nodes.filter(function (n) { return n.current })[0]
+      return current ? current.count : null
+    }
+    try {
+      const input = document.querySelector('.' + ADAPTER_FACTS.treeActiveClass + ' ' +
+        ADAPTER_FACTS.unfinishedCountInput)
       const value = input ? Number(input.value) : NaN
       return isFinite(value) ? value : null
     } catch (e) {
       return null
     }
+  }
+
+  // 「当前节点之后还有多少个任务点没完成（含 PPT）」—— 各节点计数之和，只用来展示（ADR 0010）
+  function readRemainingUnfinished(tree) {
+    if (!tree) return null
+    let pastCurrent = false
+    let total = 0
+    for (let i = 0; i < tree.nodes.length; i++) {
+      const node = tree.nodes[i]
+      if (node.current) {
+        pastCurrent = true
+        continue
+      }
+      if (pastCurrent && node.count !== null) total += node.count
+    }
+    return total
   }
 
   function findInDocuments(selector, test) {
@@ -794,6 +992,9 @@
     return null
   }
 
+  // 章节树一秒读一遍就够（节点数就是整门课的节点数）；决策与状态条共用这一份
+  const currentTree = memo(readTree, 1000)
+
   const detectRiskControl = memo(function () {
     return !!findInDocuments(PAGE_CANDIDATES, function (el) {
       const text = shortText(el, 200)
@@ -856,6 +1057,7 @@
         faceCaptureRequired: detectFaceCapture(),
       },
       card: observeCard(),
+      tree: currentTree(),
       taskPoints: taskPoints,
       media: observeMedia(),
     }
@@ -889,12 +1091,15 @@
 
     observe: observe,
 
-    // 进度是**当前卡片**的 x/y（DOM 里只有这一张卡片的任务点），另加平台自己给的
-    // 「本节点未完成 N（含 PPT）」—— 那个数含 PPT、不会归零，所以不写成「还剩 N 个要做」。
+    // 进度是**当前卡片**的 x/y（DOM 里只有这一张卡片的任务点），另加平台自己给的计数：
+    //   · 树拿得到 → 「后面还有 M 个任务点未完成（含 PPT）」（当前节点之后各节点之和，ADR 0010）
+    //   · 树拿不到 → 退回「本节点未完成 N（含 PPT）」
+    // 两个数都含 PPT、不会归零，所以都不写成「还剩 N 个要做」。
     // memory 只用来读 pending 那条倒计时（唯一来源在决策核心，适配层不自己算时限）
     progressText: function (memory) {
       const points = currentTaskPoints()
       const card = observeCard()
+      const tree = currentTree()
       const parts = []
       if (points.length === 0) {
         parts.push('本卡片无任务点')
@@ -903,8 +1108,12 @@
         parts.push('本卡片 ' + done + '/' + points.length)
       }
       if (card.total > 1) parts.push('卡片 ' + card.active + '/' + card.total)
-      const nodeUnfinished = readNodeUnfinished()
-      if (nodeUnfinished !== null) parts.push('本节点未完成 ' + nodeUnfinished + '（含 PPT）')
+      const remaining = readRemainingUnfinished(tree)
+      if (remaining !== null) parts.push('后面还有 ' + remaining + ' 个任务点未完成（含 PPT）')
+      else {
+        const nodeUnfinished = readNodeUnfinished(tree)
+        if (nodeUnfinished !== null) parts.push('本节点未完成 ' + nodeUnfinished + '（含 PPT）')
+      }
       const media = findMedia()
       const playing = media && media.duration && isFinite(media.duration)
       if (playing) {
@@ -927,6 +1136,9 @@
           return
         case ACTION.OPEN_TASK_POINT:
           locateNextPlayable(action.card)
+          return
+        case ACTION.JUMP_NODE:
+          jumpToNode(action.nodeId)
           return
         case ACTION.ADVANCE: {
           const entry = findNextEntry()
@@ -965,7 +1177,9 @@
     loginRiskControl: '检测到多端登录风控警告，已停下 —— 请只保留一个设备在线',
     faceCaptureCourse: '这门课启用了人脸抓拍，脚本无法自动化，已放弃',
     mediaNotFound: '一直没找到可播的视频/音频元素，等了 ' + secs(C.UNREADY_TIMEOUT_MS) +
-      ' 秒也没有，已停下 —— 可能是任务点结构变了，或卡片层认不出来',
+      ' 秒也没有，已停下 —— 可能是任务点结构变了、卡片层认不出来，或跳节点没生效',
+    treeUnfinishedNotFound: '章节树说本节点还有未完成，脚本扫遍全部卡片却一个未完成任务点都没看到 —— ' +
+      '判定不可信（多半是任务点的容器变了），已停下',
     mediaIncompleteConfirm: '平台弹出了「还有任务点未完成」，但脚本还没把本节点的可播任务点找完/播完 —— 判断不可信，脚本不替你确认',
     dialogWithoutUnfinished: '平台弹出「还有任务点未完成」，但脚本扫遍本节点却一个未完成任务点都没看到 —— 判定不可信，已停下',
     mediaLoadFailed: '视频/音频加载失败，已停下' + RESUME_EXHAUSTED,
@@ -973,7 +1187,8 @@
     manualPause: '播放被暂停了，已停下 —— 点「继续」接着跑' + RESUME_EXHAUSTED,
     stalled: '播放卡住了（进度 ' + secs(C.STALL_TIMEOUT_MS) + ' 秒不前进），已停下',
     playbackRefused: '浏览器拒绝了自动播放，已停下 —— 请手动点一下播放' + RESUME_EXHAUSTED,
-    courseCompleted: '没有「下一节」入口了，脚本结束 —— 若后面还有内容，多半是页面结构变了',
+    courseCompleted: '当前节点之后没有带未完成计数的节点了，脚本结束 —— 若还有内容，' +
+      '多半是章节树没渲染全、或只剩脚本播不了的任务点',
     running: '正在运行',
   }
 
@@ -981,8 +1196,12 @@
   // 两类必须一眼分得开，否则「还剩 4 秒」到底是动手还是放弃都得猜
   const PENDING_TEXT = {
     [PENDING.EMPTY_CARD]: function (s) { return s + ' 秒后跳过本卡片' },
-    [PENDING.ADVANCE_DELAY]: function (s) { return s + ' 秒后继续推进' },
-    [PENDING.ADVANCE_COOLDOWN]: function (s) { return s + ' 秒后重试推进' },
+    [PENDING.TREE_NOT_READY]: function (s) { return s + ' 秒后改用「下一节」推进' },
+    // 下次推进是「跳到某个节点」时就把它的短号报出来，否则只说继续推进（ADR 0010）
+    [PENDING.ADVANCE_DELAY]: function (s, p) {
+      return p.label ? s + ' 秒后跳到 ' + p.label : s + ' 秒后继续推进'
+    },
+    [PENDING.ADVANCE_COOLDOWN]: function (s) { return s + ' 秒后重试跳转' },
     [PENDING.UNREADY]: function (s) { return '再等 ' + s + ' 秒没动静就停下' },
     [PENDING.AUTO_RESUME]: function (s, p) {
       return s + ' 秒后自动续播（第 ' + p.attempt + '/' + p.max + ' 次）'
