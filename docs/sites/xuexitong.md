@@ -123,12 +123,14 @@ GET mooc1.xuexitong.com/mooc-ans/multimedia/log/a/{personid}/{sessionhash}
   ```
 
 - ⚠️ **只有资料附件或空内容的节点，这两个标记一个都没有**（`0006` 说它们不进计数，这里得到印证）。所以「这个节点还有事没做」的判据是 `input.jobUnfinishCount` **存在**，不是「没有 `icon_Completed`」。
-- **当前节点额外带 `posCatalog_active`**，全树唯一。节点短号（`4.1`）在 `span.posCatalog_sbar` 里，节点全名在 `span.posCatalog_name[title]` 里。
+- **当前节点额外带 `posCatalog_active`**，全树唯一。节点短号（`4.1`）在 **`em.posCatalog_sbar`** 里（⚠️ 是 `em` 不是 `span`，写成 `span.posCatalog_sbar` 会一个都取不到——真机验收时踩过），节点全名在 `span.posCatalog_name[title]` 里。
 - **跳节点的入口就是站点自己的**：点 `span.posCatalog_name`（`onclick="getTeacherAjax(courseId, clazzid, chapterId)"`）。实测（同一门课里从 2.3 跳到 4.1、再从 4.1 跳到 4.2）：
   - 一次 `GET mooc-ans/mycourse/studentstudyAjax` 换掉 `#mainid`，URL 跟着变，**不整页重载**——`window` 上的全局变量与脚本实例都活着，被停掉的脚本状态条原样留着；
   - **跨章跳转不需要 `changeCapter`**（`PCount.next` 走到底才 `POST changeCapter`，`getTeacherAjax` 不碰它）；
   - **不弹「还有任务点未完成」确认框**——`checkJob()` 只写在 `PCount.next` 里。实测从**仍有 1 个未完成任务点**的 4.1 直接跳走，两个弹层都是 `0×0`。
-- ⚠️ **跳过去之后树不会自己刷新**：跳转只产生 `studentstudyAjax` + `validatejobcount`，**没有** `studentstudycourselist`。所以「刚播完的节点在树上仍写着未完成」是常态——选目标不能假设树是新鲜的。（`PCount.next` 那条路上会零星出现 `studentstudycourselist`，树跳转这条不会。）
+- 跳转本身只产生 `studentstudyAjax` + `validatejobcount`（后者由 `getTeacherAjax` 里那句 `$("#cur"+chapterId+" .orangeNew")` 触发）。
+- ⚠️ **树会被平台自己刷新，但何时刷新不可控**（2026-09-29 更正）：实测跳转之后**接着出现**一次 `studentstudycourselist?chapterId=<目标节点>`（紧跟在目标节点的播放器初始化之后）。⚠️ 所以「选目标不能假设树是新鲜的」仍然是结论，只是理由换了——不是「不会刷新」，而是**刷新时机不受脚本控制**（`0010` 的「只向前」正是为此）。
+  ⚠️ **更正一条旧记录**：本条先前写的是「跳过去之后树不会自己刷新」，证据是「跳转只产生 `studentstudyAjax` + `validatejobcount`」。那条证据**无效**——当时的 grep 模式里写的是 `coursetree` / `catalog`，**匹配不到 `studentstudycourselist` 这个词**，属于「看漏了却当成没发生」。记在这里当教训：**否定性结论要么用完整日志，要么别写。**
 - ⚠️ `GET mooc-ans/edit/validatejobcount?courseId=…&clazzid=…&nodeid=…` 的响应体是字符串 `"true"`，**不是计数**，别当实时数据源。
 - 树上 39 个节节点**全部**带 `getTeacherAjax` 的 onclick，实测没有锁定态、也没有「未解锁」标记。
 

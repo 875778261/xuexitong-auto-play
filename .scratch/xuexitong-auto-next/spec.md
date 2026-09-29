@@ -294,7 +294,7 @@ Status: ready-for-agent
 
 1. **整棵章节树就在学习页的主文档里**（`#coursetree`，由 `mycourse/studentstudycourselist` 铺满；服务端那份 HTML 里是空的）。每个「节」= `div.posCatalog_select#cur<chapterId>`，当前节点带 `posCatalog_active`；已完成 = `span.icon_Completed`，未完成 = `input.jobUnfinishCount`，**两者互斥**，而**只有资料附件或空内容的节点两个都没有**。
 2. **跳节点的入口就是站点自己的** `span.posCatalog_name[onclick=getTeacherAjax(courseId, clazzid, chapterId)]`。实测（同一门课 2.3 → 4.1 → 4.2）：一次 `studentstudyAjax` 换掉 `#mainid`，**不整页重载**（`window` 全局与脚本实例都活着）、**跨章不需要 `changeCapter`**、**不弹「还有任务点未完成」确认框**（`checkJob()` 只写在 `PCount.next` 里；从仍有 1 个未完成任务点的 4.1 直接跳走，两个弹层都是 `0×0`）。
-3. **跳过去之后树不会自己刷新**（跳转只产生 `studentstudyAjax` + `validatejobcount`，后者只回字符串 `"true"`）。所以选目标不能假设树是新鲜的，也不能拿它当实时计数源。
+3. **树会被平台自己刷新，但时机不可控**（跳转本身只产生 `studentstudyAjax` + `validatejobcount`，后者只回字符串 `"true"`；实测跳转之后会接着出现一次 `studentstudycourselist?chapterId=<目标节点>`）。所以选目标不能假设树是新鲜的，也不能拿它当实时计数源。⚠️ 本条先前写成「跳过去之后树不会自己刷新」，那条否定性结论建立在一次**模式写错**的 grep 上（`coursetree` 匹配不到 `studentstudycourselist`），已在 `docs/sites` 里更正。
 4. 树上 39 个节节点**全部**带 `getTeacherAjax` 的 onclick，没有锁定态。
 
 用户确认的决定（全部按推荐）：

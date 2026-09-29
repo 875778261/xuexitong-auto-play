@@ -8,7 +8,7 @@
 
 - **整棵章节树就在学习页的主文档里**（`#coursetree`，由 `studentstudycourselist` 铺满），每个「节」是 `div.posCatalog_select#cur<chapterId>`，当前节点额外带 `posCatalog_active`。节点上有两个**互斥**标记：已完成 = `span.icon_Completed`，未完成 = `input.jobUnfinishCount`（值 = 待完成数，含 PPT）；**只有资料附件或空内容的节点两个都没有**。
 - **跳节点的入口就是站点自己的**：`span.posCatalog_name` 的 `onclick="getTeacherAjax(courseId, clazzid, chapterId)"`。实测它一次 `GET studentstudyAjax` 换掉 `#mainid`：**不整页重载**（`window` 全局与脚本实例都活着）、**跨章也不需要 `changeCapter`**、而且**不弹「还有任务点未完成」确认框**——`checkJob()` 只写在 `PCount.next` 里，`getTeacherAjax` 里没有。
-- **跳过去之后树不会自己刷新**（跳转只产生 `studentstudyAjax` + `validatejobcount`，后者只回 `"true"`）。所以**选目标不能假设树是新鲜的**：刚播完的节点在树上可能仍然写着未完成。
+- **树会被平台自己刷新，但时机不可控**（跳转本身只产生 `studentstudyAjax` + `validatejobcount`，后者只回 `"true"`；实测跳转之后会接着出现一次 `studentstudycourselist?chapterId=<目标节点>`）。所以**选目标不能假设树是新鲜的**：刚播完的节点在树上可能仍然写着未完成。
 
 因此我们决定：**「推进」从「点邻节点的下一节」改成「从章节树跳到下一个未完成节点」，且只向前。**
 
