@@ -102,6 +102,36 @@ GET mooc1.xuexitong.com/mooc-ans/multimedia/log/a/{personid}/{sessionhash}
 - **拦不拦只看 `checkJob()`**：`PCount.next(count, chapterId, courseId, clazzid, knowledgestr, checkType)` 的源码里，`checkType && !courseEnded && checkJob()` 为真才 `showCheckDiv(true)` 弹确认框并 `return`，否则往下走真正的跳转。实测在 `1.1 音标教学PPT`、`2.1.2 《……够了》系列电子书`、`2.1.1 词根词缀背单词`（都只有资料附件或空内容）上推进，**一次确认框都没弹**。
 - **跳转已确认是局部刷新，不是整页重载**：主文档不重载，只换 URL 与卡片内容（实测：状态条上停住的旧判定连续跨三次换节都没被重置，`performance.now()` 显示文档已开了 96 秒）。⚠️ 推论很重要——**脚本实例跨节点存活**，它一旦在某个节点停下，从这里往后的所有节点都不会再被它管，除非用户点「继续」。
 
+## 章节树与跳节点
+
+- **学习页主文档里就有整棵章节树**，不用回课程页：`div.posCatalog#coursetree`。内容是 `GET mooc-ans/mycourse/studentstudycourselist?courseId=…&chapterId=…&clazzid=…&cpi=…&mooc2=1&searchChapterListByName=` 铺出来的（`$(document).ready` 里一次；成功回调是 `document.getElementById("coursetree").innerHTML = data`，整段替换）。**服务端那份 HTML 里的树是空的**，所以启动瞬间可能还没有节节点。
+- 树的两级：**章** = `div.posCatalog_select.firstLayer`（id 就是 chapterId，没有 `posCatalog_name`，只有 `span.posCatalog_title`）；**节** = `div.posCatalog_select#cur<chapterId>`，判据是 **id 以 `cur` 开头**。
+- 节的形状与两个**互斥**标记（实测同一门课里两种都在）：
+
+  ```html
+  <!-- 已完成 -->
+  <div class="posCatalog_select" id="cur<chapterId>">
+    <span class="posCatalog_name" title="…" onclick="getTeacherAjax('<courseId>','<clazzid>','<chapterId>');">…</span>
+    <span class="icon_Completed prevTips">…已完成…</span>
+  </div>
+  <!-- 未完成 -->
+  <div class="posCatalog_select" id="cur<chapterId>">
+    <span class="posCatalog_name" …onclick="getTeacherAjax(…)">…</span>
+    <input type="hidden" class="jobUnfinishCount" value="1">
+    <span class="catalog_points_yi"><span class="orangeNew">1</span></span>
+  </div>
+  ```
+
+- ⚠️ **只有资料附件或空内容的节点，这两个标记一个都没有**（`0006` 说它们不进计数，这里得到印证）。所以「这个节点还有事没做」的判据是 `input.jobUnfinishCount` **存在**，不是「没有 `icon_Completed`」。
+- **当前节点额外带 `posCatalog_active`**，全树唯一。节点短号（`4.1`）在 `span.posCatalog_sbar` 里，节点全名在 `span.posCatalog_name[title]` 里。
+- **跳节点的入口就是站点自己的**：点 `span.posCatalog_name`（`onclick="getTeacherAjax(courseId, clazzid, chapterId)"`）。实测（同一门课里从 2.3 跳到 4.1、再从 4.1 跳到 4.2）：
+  - 一次 `GET mooc-ans/mycourse/studentstudyAjax` 换掉 `#mainid`，URL 跟着变，**不整页重载**——`window` 上的全局变量与脚本实例都活着，被停掉的脚本状态条原样留着；
+  - **跨章跳转不需要 `changeCapter`**（`PCount.next` 走到底才 `POST changeCapter`，`getTeacherAjax` 不碰它）；
+  - **不弹「还有任务点未完成」确认框**——`checkJob()` 只写在 `PCount.next` 里。实测从**仍有 1 个未完成任务点**的 4.1 直接跳走，两个弹层都是 `0×0`。
+- ⚠️ **跳过去之后树不会自己刷新**：跳转只产生 `studentstudyAjax` + `validatejobcount`，**没有** `studentstudycourselist`。所以「刚播完的节点在树上仍写着未完成」是常态——选目标不能假设树是新鲜的。（`PCount.next` 那条路上会零星出现 `studentstudycourselist`，树跳转这条不会。）
+- ⚠️ `GET mooc-ans/edit/validatejobcount?courseId=…&clazzid=…&nodeid=…` 的响应体是字符串 `"true"`，**不是计数**，别当实时数据源。
+- 树上 39 个节节点**全部**带 `getTeacherAjax` 的 onclick，实测没有锁定态、也没有「未解锁」标记。
+
 ## 防挂机机制
 
 - 平台**自陈**的成因就在视频任务点的「完成条件」文案里：**「未完成任务点前，当前视频不可倍速、不可拖拽、观看时不可离开或将页面最小化」**——防挂机不是附加的限制，它就是完成条件的执行方式。
