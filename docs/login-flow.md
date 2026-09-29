@@ -18,7 +18,7 @@
 
 ```bash
 cd <repo root>
-playwright-cli -s=xuexitong open https://i.xuexitong.com/base --headed
+playwright-cli -s=xuexitong open --headed https://i.xuexitong.com/base
 ```
 
 在弹出的窗口里**由人工**完成登录。agent 不参与登录、不索取凭据。
@@ -32,10 +32,10 @@ playwright-cli -s=xuexitong close
 
 ## 日常复用
 
-直接开，不带任何额外参数：
+直接开（`--headed` 照旧显式带上，不依赖 CLI 默认值）：
 
 ```bash
-playwright-cli -s=xuexitong open 'https://i.xuexitong.com/base?ws=1'
+playwright-cli -s=xuexitong open --headed 'https://i.xuexitong.com/base?ws=1'
 ```
 
 判据：`Page URL` 若为 `https://passport2.xuexitong.com/login?...`，说明登录态已失效 → 回到「首次登录」重做一次。

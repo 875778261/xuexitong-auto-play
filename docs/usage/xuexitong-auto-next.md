@@ -3,7 +3,7 @@
 - 脚本：[`src/xuexitong-auto-next.user.js`](../../src/xuexitong-auto-next.user.js)（`@version 1.0.0`）
 - 目标站点：`mooc1.xuexitong.com` 的**学习页面**（`.scratch/xuexitong-auto-next/spec.md` 是本脚本的完整决策依据）
 - 当前行为口径：**第六轮**——媒体没在播时不再直接停下，走两段续播阶梯（5 次 → 重启一次脚本 → 再 3 次 → 才真正停下），见 [`docs/adr/0009`](../adr/0009-auto-resume-ladder.md)
-- 还没装过？先看 [`安装指南.md`](./安装指南.md)（只讲装篡改猴与装脚本的新手版）
+- 还没装过？先看仓库根目录的 [`README.md`](../../README.md)（装篡改猴 + 装脚本的新手版，面向不懂代码的使用者）
 
 ---
 
@@ -11,16 +11,7 @@
 
 前置：浏览器装好 **Tampermonkey**（Chrome / Edge 均可，本脚本按 Chromium 内核的行为实现）。
 
-### 最快的一条路（手动）
-
-1. 把 `src/xuexitong-auto-next.user.js` **拖进浏览器窗口**（或地址栏直接打开这个本地文件）——Tampermonkey 会拦截并弹出安装页；
-2. 点安装页上的**「安装」/「重新安装」**；
-3. 打开任一学习页，右下角出现状态条（黑底、标题「学习通 · 自动播放下一节」）即安装成功。
-
-备用两条：
-
-- 在仓库根目录起一个静态服务（例：`python -m http.server 8123`），浏览器打开 `http://127.0.0.1:8123/src/xuexitong-auto-next.user.js`；
-- Tampermonkey 面板 → **添加新脚本** → 全选删掉模板 → 粘贴脚本全文 → `Ctrl+S` 保存。
+**装篡改猴、装脚本的完整三步在仓库根目录的 [`README.md`](../../README.md)** —— 那是唯一的新手路径，面向不懂代码的使用者，本文不再重复。本节只留两件与这个脚本有关的事：确认版本、更新。
 
 ### 装好了怎么确认版本
 
@@ -36,7 +27,7 @@ typeof (window.__xuexitongAutoNext || {}).ACTION.AUTO_RESUME   // 期望 "string
 
 和安装是同一条路：**再走一遍安装流程、点「重新安装」覆盖**。Tampermonkey 面板里的「更新」只对 `@updateURL` 生效，本脚本没配 `@updateURL`，不会自己更新。
 
-> 给 agent / 自动化：`playwright-cli` 打开 `.user.js` 的 URL 后**只 `reload` 不会弹安装页**（页面停在裸 JS 文本上），要 **`goto` 同一个 URL** 才会唤起安装页（并另开一个 `chrome-extension://…/ask.html` 标签页）——`tab-select 1` → 点「重新安装」，装完两个标签页都会关掉。步骤见 `.scratch/xuexitong-auto-next/issues/03`。
+> 给 agent / 自动化：完整流程（含硬边界）见 [`docs/agents/userscript-install-via-playwright.md`](../agents/userscript-install-via-playwright.md)。那条路上唯一的坑：`playwright-cli` 打开 `.user.js` 的 URL 后**只 `reload` 不会弹安装页**（页面停在裸 JS 文本上），要 **`goto` 同一个 URL** 才会唤起安装页（并另开一个 `chrome-extension://…/ask.html` 标签页）——`tab-select 1` → 点「重新安装」，装完两个标签页都会关掉。
 
 ---
 

@@ -27,7 +27,7 @@ node src/tests/decision.test.js 暂停    # 只跑名字里含「暂停」的
 写或改脚本之前，先用 `playwright-cli` 对目标站点开一个探查会话，看清它真实的 DOM 与运行时行为：
 
 ```bash
-playwright-cli -s=<session> open <目标站点>   # 默认 headless；登录态由配置持久化
+playwright-cli -s=<session> open --headed <目标站点>   # 一律显式加 --headed；登录态由配置持久化
 playwright-cli -s=<session> snapshot          # 可访问性树；用其中的 ref 定位元素
 playwright-cli -s=<session> find "登录"        # 在快照里按文本/正则搜索
 playwright-cli -s=<session> eval "document.title"
@@ -38,7 +38,7 @@ playwright-cli -s=<session> close
 
 - **每次探查都带会话名**（`-s=<session>`），不要用匿名会话；开始前先 `playwright-cli list` 看有没有冲突的会话。
 - **命令必须在仓库根目录执行**：`.playwright/cli.config.json` 用相对路径把 profile 指向 `.playwright/profile/`，换目录执行会另开一个空 profile、表现为"没登录"。
-- 登录态已持久化，`open` 即复用，**不需要**再传 `--persistent`；只有需要人工接管时才加 `--headed`。首次登录与失效处理见 `docs/login-flow.md`。
+- 登录态已持久化，`open` 即复用，**不需要**再传 `--persistent`。**每一处 `open` 都显式写 `--headed`**（不依赖 CLI 默认值，用户要看着浏览器）。首次登录与失效处理见 `docs/login-flow.md`。
 - 不要用 `attach --extension=chrome`——那会连上日常浏览器的真实登录会话。
 - 探查产物（快照、控制台日志）落在 `.playwright-cli/`，已在 `.gitignore` 中忽略，不要提交。
 - `snapshot --filename=<f>` 是例外：它把文件写到**当前工作目录**，在仓库根执行会直接污染仓库——用完记得移进 `.playwright-cli/`，或干脆用默认的时间戳文件名。
