@@ -1,4 +1,4 @@
-// 版本一致性检查 —— 交付机制里两处手工同步由这里兜住（docs/adr/0012、docs/adr/0013）。
+// 交付机制的机械检查 —— 元数据里几处手工同步由这里兜住（docs/adr/0012、docs/adr/0013）。
 //
 //   node src/tests/version.test.js
 //
@@ -28,6 +28,29 @@ if (metaVersion && mirrorVersion && metaVersion !== mirrorVersion) {
 // 纯数字点分是硬要求：Tampermonkey 只可靠地比较这种格式（docs/adr/0012）
 if (metaVersion && !/^\d+(\.\d+)+$/.test(metaVersion)) {
   problems.push('@version 不是纯数字点分格式（Tampermonkey 会比较不出来）：' + metaVersion)
+}
+
+// 更新链的两个出口是手工写的 URL：打错一处同样是**静默事故** —— 脚本照常跑，
+// 只是永远更新不到新版（docs/adr/0012 末尾那一节）。两个字段指向同一个文件，
+// 所以「存在、指向 main 上的这份文件、两者一致」三件事一起断言。
+const metaField = field => (source.match(new RegExp('^//\\s*' + field + '\\s+(\\S+)\\s*$', 'm')) || [])[1] || null
+const scriptFileName = path.basename(SCRIPT_PATH).replace(/\./g, '\\.')
+const rawOnMain = new RegExp('^https://raw\\.githubusercontent\\.com/[^/]+/[^/]+/main/src/' + scriptFileName + '$')
+
+const updateUrl = metaField('@updateURL')
+const downloadUrl = metaField('@downloadURL')
+
+if (!updateUrl) problems.push('元数据块里找不到 @updateURL')
+if (!downloadUrl) problems.push('元数据块里找不到 @downloadURL')
+
+for (const [field, url] of [['@updateURL', updateUrl], ['@downloadURL', downloadUrl]]) {
+  if (url && !rawOnMain.test(url)) {
+    problems.push(field + ' 没有指向 main 分支上的这个脚本文件：' + url)
+  }
+}
+
+if (updateUrl && downloadUrl && updateUrl !== downloadUrl) {
+  problems.push('两个 URL 不一致：@updateURL = ' + updateUrl + '，@downloadURL = ' + downloadUrl)
 }
 
 console.log('版本一致性：' + (problems.length ? '不通过' : '通过') +
