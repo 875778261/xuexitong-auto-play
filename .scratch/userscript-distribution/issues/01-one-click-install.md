@@ -38,11 +38,11 @@ Status: ready-for-human
 
 本工单第 1、2、4 条已落地，第 3 条（README 第二步改写）也已改写 —— 但**那条安装链接要等发布之后才点得通**：
 
-- **渠道（第 1 条）**：定为 GitHub 公开仓库 `875778261/xuexitong-auto-play`，已关联为 `origin`。⚠️ 我这边匿名访问一直返回 404、它当时也不在该账号的公开仓库列表里，所以「确实公开」**降级成验收项**，没当作已证实的事实。
+- **渠道（第 1 条）**：定为 GitHub 公开仓库 `875778261/xuexitong-auto-play`，已关联为 `origin`。⚠️ 会话中我这边匿名访问一直是 404、它当时也不在该账号的公开仓库列表里，所以「确实公开」当时**降级成验收项**；**后来已闭环** —— 发布后用真 HTTP 请求实测，`main` 的 raw 与仓库页匿名都是 **200**（那个 404 是抓取工具侧的问题，见 [`../spec.md`](../spec.md) Comments 里的更正）。
 - **元数据（第 2 条）**：`@version` 从 `1.0.0` 改成 **`1.8.0`**（`1.<行为轮次>.<补丁>`，第八轮的行为口径），补上 `@updateURL` / `@downloadURL`（两个字段都指 `main` 分支的 raw `.user.js`），脚本内加 `SCRIPT_VERSION` 常量并把版本挂在 `window.__xuexitongAutoNext.VERSION` 上。
 - **连带改动（第 4 条）**：`docs/usage/xuexitong-auto-next.md` 与 `README.md` 里「不会自己更新」的说法已改写；`docs/agents/userscript-install-via-playwright.md` 里那条「没有 `@updateURL`」也一并重写。
 - 「⚠️ `@version` 每次发版必须递增」这句脚注，已升级成一条**有机制的纪律**：见 [`docs/adr/0012`](../../../docs/adr/0012-release-branch-and-version-scheme.md)（发布边界与编号）与 [`docs/adr/0013`](../../../docs/adr/0013-version-marker-instead-of-grant.md)（页面里怎么确认版本）。
 
-**剩下的只有人要做的事**（顺序不能颠倒）：push `develop` → 建 `main` 并合入 → 把 `main` 设为默认分支。
+**首次发布已执行（2026-09-30）**：`main` 与 `develop` 都已推到 `origin`（先推 `main`，让它成为仓库默认分支）；匿名 `curl` 实测 `main` 的 raw 为 **200**，取回的正是 `@version 1.8.0` 那一份。
 
-**两条要先实证的东西**：① 匿名能不能抓到 `main` 的 raw（= 仓库确实公开）；② 使用者的网络能不能直连 `raw.githubusercontent.com`（不通就把两个 URL 改指 jsDelivr，代价是分支引用约 12 小时缓存）。此外还有一条与本工单相邻的口子：`@grant none` 下 `GM_info` 是否可读 —— 若可读，`ADR 0013` 的结论要重审。
+**还差两条只在浏览器里能验的**：① 在没装过脚本的浏览器上点 README 的安装链接 → 弹安装页 → 装完学习页右下角出现状态条；② 改一版 `@version` 重新发布 → 篡改猴面板「检查脚本更新」能拉到新版（顺带别忘了一条相邻的口子：`@grant none` 下 `GM_info` 是否可读 —— 若可读，`ADR 0013` 的结论要重审）。
