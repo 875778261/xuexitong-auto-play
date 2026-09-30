@@ -43,7 +43,8 @@
 - 任务点挂在**卡片**下（见上节）。**一张卡片会把它全部任务点一次渲染出来**（实测同一张卡片里十几个任务点同时在 DOM 里），不是懒加载。
 - **扫描入口只能是容器 `div.ans-attach-ct` 本身**：容器里那块 `div.ans-job-icon` 可能只是个空 div、也可能整个不存在（实测 PPT 卡里就有一个容器两者都没有，`jobid` 也不在 iframe 属性上、只写在 iframe 的 `data` JSON 里）。
 - **容器 ≠ 任务点**：平台把**资料附件**也塞进同样的 `div.ans-attach-ct` 里。区分的唯一可靠判据是 **`jobid`**——任务点的 `jobid` 写在模块 iframe 的属性上（PPT 的在 `data` JSON 里），**资料附件两处都没有**。实测节点「1.1 音标教学PPT」只有一个容器、里面是 `downloadfile` 模块的 `音标.ppt` 附件，被当成任务点后脚本直接停在 `unknownTaskPointKind`。
-- 章节树节点上的 `input.jobUnfinishCount` 是**整节点跨全部卡片**的未完成数，可以直接当「本节点还剩几个」用——它**随完成实时变化**（实测：某个任务点播完被判定完成时，这个数当场减一）。当前节点的那个：`div.posCatalog_active input.jobUnfinishCount`（`type=hidden`）。⚠️ 它**只在未完成数 > 0 时才渲染**：节点没有未完成任务点时页面上根本查不到这个元素（读出来是 `null`，不是 `0`）。
+- 章节树节点上的 `input.jobUnfinishCount` 是**整节点跨全部卡片**的未完成数，可以直接当「本节点还剩几个」用——它**随完成实时变化**（实测：某个任务点播完被判定完成时，这个数当场减一）。
+- ⚠️ **但那一步「实时」是服务端往返级的，不是同 tick**（2026-09-30 实测，更正上一条的措辞）：容器的 `ans-job-finished` 是**客户端当场生效**，而树的计数要等平台自己再发一次 `GET mooc-ans/mycourse/studentstudycourselist?…&chapterId=<当前节点>` 才更新（实测紧跟在那条触发完成判定的 `multimedia/log?playingTime=435` 之后）。两次实测的滞后都是 **3–6 秒**：FIN 那一刻计数还在（`value="1"`），几秒后元素整个消失。**所以「DOM 说做完了、树还说没做完」是一个正常的中转态**，不是两边矛盾。当前节点的那个：`div.posCatalog_active input.jobUnfinishCount`（`type=hidden`）。⚠️ 它**只在未完成数 > 0 时才渲染**：节点没有未完成任务点时页面上根本查不到这个元素（读出来是 `null`，不是 `0`）。
 - 任务点的完成态只有一个可靠标记：容器 `div.ans-attach-ct` 上的 **`ans-job-finished`** 类。
 - `div.ans-job-icon`（`role="option"`）只能当**「这是个任务点」的识别位**，**既不是完成判据、也不是类型判据**：未完成时它带 `aria-label="任务点未完成"`，已完成时它可能是个空 div 也可能整个不存在，两种情况都实测过。
 - **任务点的类型只能从它内部的模块 iframe 的 `src` 读**。`ans-job-icon` 的类名靠不住——视频是 `ans-job-icon ans-job-video ans-job-icon-clear`，**音频与 PPT 都是空的 `ans-job-icon `**：
@@ -56,6 +57,7 @@
   | **资料附件**（**不是任务点**） | `/ananas/modules/downloadfile/index-pc.html` | iframe 上明写 `module="downloadfile"` 与 `class="downloadfile"`；**没有 `jobid`**；`data` 只有 `objectid / name / type / size / hsize / mid`，`name` 形如 `音标.ppt`、`英语语法看这本就够了大全集.pdf` |
 
 - 视频任务点的完成条件是观看时长，**不同节点标示的比例不一致**：同一门课里见过 **90%** 与 **100%** 两种。
+- ⚠️ **「被判定完成」可以远早于媒体 `ended`**（2026-09-30 实测，两条视频对照）：上报 URL 里带 `rt=0.9`（完成比例）；比例 < 1 的视频在**还剩几十秒**时容器就戴上 `ans-job-finished`——实测那一刻 `currentTime=437/489`（89.3%，**还剩 53 秒**），容器变 FIN 之后媒体一直播到 `490/490`，平台才自己 `pause()`。同一门课里 `rt=1` 的那条（242 秒）是**播到 `241/242` 才** FIN。**「完成」与「播完」是两个时刻，不能互推。**
 - **PPT 任务点没有 `currentTime`**。它的完成条件是**把内容拉到最底端**：滚到底会触发一次
   `GET mooc-ans/job/document?jobid=…&knowledgeid=…&courseid=…&clazzid=…&jtoken=…`，
   响应 `{"msg":"添加考核点成功","status":true}`，之后容器才带上 `ans-job-finished`。
@@ -133,6 +135,8 @@ GET mooc1.xuexitong.com/mooc-ans/multimedia/log/a/{personid}/{sessionhash}
   ⚠️ **更正一条旧记录**：本条先前写的是「跳过去之后树不会自己刷新」，证据是「跳转只产生 `studentstudyAjax` + `validatejobcount`」。那条证据**无效**——当时的 grep 模式里写的是 `coursetree` / `catalog`，**匹配不到 `studentstudycourselist` 这个词**，属于「看漏了却当成没发生」。记在这里当教训：**否定性结论要么用完整日志，要么别写。**
 - ⚠️ `GET mooc-ans/edit/validatejobcount?courseId=…&clazzid=…&nodeid=…` 的响应体是字符串 `"true"`，**不是计数**，别当实时数据源。
 - 树上 39 个节节点**全部**带 `getTeacherAjax` 的 onclick，实测没有锁定态、也没有「未解锁」标记。
+- ⚠️ **`studentstudyAjax` 的响应可能不是节点内容，而是「章级人脸识别」页**（2026-09-30 读主文档脚本确认）：站点自己在 success 回调里写着 `jQuery('#mainid').html(data); if(document.getElementById("chapterFaceState") != null){ //人脸识别 return; }` —— 命中时它**提前 return**，于是「点 `posCatalog_name` 跳节点」这条路**静默不生效**（`posCatalog_active` 也不会更新）。主文档里还有 `faceCheckOverJump(chapterId, courseId, clazzid, faceCheckEnc, faceCheckTime)` 与注释「人脸采集」；视频模块的配置 JSON 里另有 `randomFaceCaptureTimeList` / `randomCaptureTime`。脚本侧的现象：跳转失败判据（当前节点没变成目标）与 `detectFaceCapture()` 都可能因此触发。
+- 🔍 **一条未复现的观察，待查**（2026-09-30）：探查中脚本曾以 `faceCaptureCourse` 停过一次（视频播到 `67/242` 秒时），但事后用**同一套判据**在页面里复查是 **0 命中**（含隐藏模板也没有「人脸」字样），全程没有任何人脸抓拍专用请求，同 session 里另外两条视频播到自然结束都没触发。判据本身（主文档 `<script>` 里 `videoFaceCaptureEnc=…`，或**任意同源文档里可见的短文本**含「人脸抓拍 / 人脸识别」）看起来会误报；**下次复现时先抓那一刻到底匹配到了哪个元素**。⚠️ 顺带更正：上报参数 `videoFaceCaptureEnc` **不是**「本视频启用人脸抓拍」的可靠标志——实测它在这门课里有的视频非空、有的为空，与是否真的抓拍对不上。
 
 ## 防挂机机制
 
