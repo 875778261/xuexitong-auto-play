@@ -31,14 +31,15 @@ playwright-cli -s=xuexitong click <上一步给出的那个 button 的 ref>
 
 # 4. 点完两个标签页都会关掉，只剩 about:blank；再导航到学习页确认版本
 playwright-cli -s=xuexitong goto <学习页 URL>
-playwright-cli -s=xuexitong eval "typeof (window.__xuexitongAutoNext||{}).ACTION.AUTO_RESUME"
+playwright-cli -s=xuexitong eval "window.__xuexitongAutoNext.VERSION"
 ```
 
 - **第 2 步是这套流程唯一的坑**：`open` 之后只 `reload`，页面会停在裸 JS 文本上、**不弹安装页**；换成 `goto` 才会唤起 Tampermonkey。
 - **第 3 步的 ref 每轮都会变**（本轮是 `e59`），别写死，用 `find` 现取。按钮文案取决于是否已装过：**首次是「安装」，覆盖升级才是「重新安装」**——`find "安装"` 两种都能命中。
 - 本仓库没有构建工具链（连 `package.json` 都没有）：脚本就是 `src/xuexitong-auto-next.user.js` 这一个文件，改了它必须走一遍上面的流程才会在页面里生效。
-- 确认安装的那条 `eval`：返回 **`"string"`** = 第六轮起的新版；**`"undefined"`** = 旧版，或脚本没注入（检查 `@match` 与 `isStudyPage()`）。
-- **本脚本没有 `@updateURL` / `@downloadURL`**：Tampermonkey 面板里的「更新」不会生效，只能像上面这样覆盖安装。补这两个字段（并发布）是待办，见 [`.scratch/userscript-distribution/issues/01`](../../.scratch/userscript-distribution/issues/01-one-click-install.md)。
+- 确认安装的那条 `eval`：返回 **`"1.8.0"` 这样一串号** = 装的就是这一版（号等于元数据块里的 `@version`，两处一致由 `src/tests/version.test.js` 断言）；**`"undefined"`** = 第八轮及以前的旧版，或脚本没注入（检查 `@match` 与 `isStudyPage()`）。想确认「某个能力在不在」，再查**功能标记**，例如 `typeof (window.__xuexitongAutoNext||{}).CONSTANTS.TREE_RECHECK_GRACE_MS`（`"number"` = 至少第八轮）。
+- **本脚本已配 `@updateURL` / `@downloadURL`**，两个字段都指向**发布分支 `main`** 的 raw `.user.js`。于是：上面这套**覆盖安装**照样能用（`develop` 上的改动想在页面里验证，就得靠它，因为篡改猴只会从 `main` 拉更新）；而使用者的升级交给篡改猴自己 —— **发布 = 合入 `main`**，见 [`docs/adr/0012`](../adr/0012-release-branch-and-version-scheme.md)。
+- ⚠️ **一条未实证的说法**：本仓库文档原先写「篡改猴面板里的『更新』**只**对 `@updateURL` 生效」。检索到的实际行为是**一条回退链**（`@updateURL` → `@downloadURL` → 安装来源 URL），但官方文档正文是 JS 渲染的、只取到了目录，**改写相关文案之前先真机验一次**，别照抄这一条。
 
 ## 装完怎么读页面状态（只读）
 

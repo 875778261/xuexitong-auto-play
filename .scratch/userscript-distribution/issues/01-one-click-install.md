@@ -2,6 +2,8 @@
 
 Status: ready-for-human
 
+> 2026-09-30：机制与元数据都已落地，**只剩「人来做发布」这一步**（push `develop` → 建 `main` → 设默认分支），见文末 Comments 与 [`../spec.md`](../spec.md) 的待办。
+
 ## 背景
 
 脚本今天只能靠「把 `.user.js` 文件递给使用者」分发——`README.md` 的第二步就是照这个现实写的。仓库没有任何远端（`.git/config` 只有 `[core]`，无 `[remote]`），没有 `.github/`、没有 CI / Pages，脚本元数据块里也没有 `@downloadURL` / `@updateURL`。
@@ -31,3 +33,16 @@ Status: ready-for-human
 - 不动脚本的行为代码 —— 本工单只碰元数据块与文档。
 
 ## Comments
+
+### 2026-09-30 机制落地（走 `/grill-with-docs`，完整结论与验收见 [`../spec.md`](../spec.md)）
+
+本工单第 1、2、4 条已落地，第 3 条（README 第二步改写）也已改写 —— 但**那条安装链接要等发布之后才点得通**：
+
+- **渠道（第 1 条）**：定为 GitHub 公开仓库 `875778261/xuexitong-auto-play`，已关联为 `origin`。⚠️ 我这边匿名访问一直返回 404、它当时也不在该账号的公开仓库列表里，所以「确实公开」**降级成验收项**，没当作已证实的事实。
+- **元数据（第 2 条）**：`@version` 从 `1.0.0` 改成 **`1.8.0`**（`1.<行为轮次>.<补丁>`，第八轮的行为口径），补上 `@updateURL` / `@downloadURL`（两个字段都指 `main` 分支的 raw `.user.js`），脚本内加 `SCRIPT_VERSION` 常量并把版本挂在 `window.__xuexitongAutoNext.VERSION` 上。
+- **连带改动（第 4 条）**：`docs/usage/xuexitong-auto-next.md` 与 `README.md` 里「不会自己更新」的说法已改写；`docs/agents/userscript-install-via-playwright.md` 里那条「没有 `@updateURL`」也一并重写。
+- 「⚠️ `@version` 每次发版必须递增」这句脚注，已升级成一条**有机制的纪律**：见 [`docs/adr/0012`](../../../docs/adr/0012-release-branch-and-version-scheme.md)（发布边界与编号）与 [`docs/adr/0013`](../../../docs/adr/0013-version-marker-instead-of-grant.md)（页面里怎么确认版本）。
+
+**剩下的只有人要做的事**（顺序不能颠倒）：push `develop` → 建 `main` 并合入 → 把 `main` 设为默认分支。
+
+**两条要先实证的东西**：① 匿名能不能抓到 `main` 的 raw（= 仓库确实公开）；② 使用者的网络能不能直连 `raw.githubusercontent.com`（不通就把两个 URL 改指 jsDelivr，代价是分支引用约 12 小时缓存）。此外还有一条与本工单相邻的口子：`@grant none` 下 `GM_info` 是否可读 —— 若可读，`ADR 0013` 的结论要重审。

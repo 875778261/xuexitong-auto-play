@@ -1,6 +1,6 @@
 # 学习通「自动播放下一节」使用指南
 
-- 脚本：[`src/xuexitong-auto-next.user.js`](../../src/xuexitong-auto-next.user.js)（`@version 1.0.0`）
+- 脚本：[`src/xuexitong-auto-next.user.js`](../../src/xuexitong-auto-next.user.js)（`@version 1.8.0`，版本号读法与发布纪律见 [`docs/adr/0012`](../adr/0012-release-branch-and-version-scheme.md)）
 - 目标站点：`mooc1.xuexitong.com` 的**学习页面**（`.scratch/xuexitong-auto-next/spec.md` 是本脚本的完整决策依据）
 - 当前行为口径：**第八轮**——推进不再是「点一次下一节、走一个节点」，而是**从章节树直接跳到当前节点之后第一个未完成节点**（只向前），见 [`docs/adr/0010`](../adr/0010-jump-to-next-unfinished-node.md)；而且**平台判定「完成」不等于媒体播完**，脚本会把手上这条播完再推进，见 [`docs/adr/0011`](../adr/0011-completion-is-not-ended.md)。再往前一档的两段续播阶梯见 [`docs/adr/0009`](../adr/0009-auto-resume-ladder.md)
 - 还没装过？先看仓库根目录的 [`README.md`](../../README.md)（装篡改猴 + 装脚本的新手版，面向不懂代码的使用者）
@@ -18,15 +18,28 @@
 在目标学习页的控制台执行：
 
 ```js
+window.__xuexitongAutoNext.VERSION   // 期望 "1.8.0"
+```
+
+返回一个像 `"1.8.0"` 的号 = 脚本在这页跑起来了，这就是篡改猴面板里那个 `@version`；返回 `undefined` = 装的是旧版，或脚本压根没在这页跑起来（先看 `@match`，见第二节）。
+
+号怎么读：**`1.<轮次>.<补丁>`** —— 中间那位是**行为口径的轮次**（`1.8.0` = 第八轮）。所以看到号就知道轮次，也就知道有没有你要的那个修复。
+
+只想确认「某个特定能力在不在」，改用**功能标记** —— 脚本里那处能分辨轮次的存在性印记，例如：
+
+```js
 typeof (window.__xuexitongAutoNext || {}).CONSTANTS.TREE_RECHECK_GRACE_MS   // 期望 "number"（第八轮起才有的常量）
 ```
 
-返回 `"number"` = 装的是当前版本；`"undefined"` = 装的是旧版或脚本没在这页跑起来（先看 `@match`，见第二节）。
-只想确认「至少是第七轮」就查 `ACTION.JUMP_NODE`（期望 `"string"`）。⚠️ 别指望版本号：本脚本的 `@version` 至今没随改动升过，能拿来分辨版本的只有这些**功能标记**。
+⚠️ 功能标记与版本号分工不同：**功能标记只回答「至少是第几轮」，不回答「是不是最新」**——那个问题只有版本号答得了（见 [`docs/adr/0013`](../adr/0013-version-marker-instead-of-grant.md)）。
 
 ### 更新脚本
 
-和安装是同一条路：**再走一遍安装流程、点「重新安装」覆盖**。Tampermonkey 面板里的「更新」只对 `@updateURL` 生效，本脚本没配 `@updateURL`，不会自己更新。
+**正常情况下不用管**：脚本配了自动更新（`@updateURL` 指向发布分支 `main` 上的这份文件），篡改猴会自己定期检查、拿到新版自动装上。
+
+想立刻拉一次：篡改猴的「管理面板」→ **「检查脚本更新」**（不同版本位置略有差别，一般在「实用工具」那一带）。
+
+⚠️ **发布发生在 `main` 分支上**（日常开发在 `develop`）：维护者若刚修好、还没合入 `main`，你这里自然拿不到 —— 那不是更新坏了，见 [`docs/adr/0012`](../adr/0012-release-branch-and-version-scheme.md)。
 
 > 给 agent / 自动化：完整流程（含硬边界）见 [`docs/agents/userscript-install-via-playwright.md`](../agents/userscript-install-via-playwright.md)。那条路上唯一的坑：`playwright-cli` 打开 `.user.js` 的 URL 后**只 `reload` 不会弹安装页**（页面停在裸 JS 文本上），要 **`goto` 同一个 URL** 才会唤起安装页（并另开一个 `chrome-extension://…/ask.html` 标签页）——`tab-select 1` → 点「重新安装」，装完两个标签页都会关掉。
 
@@ -65,9 +78,15 @@ typeof (window.__xuexitongAutoNext || {}).CONSTANTS.TREE_RECHECK_GRACE_MS   // �
 | `ADVANCE_REPEAT_GUARD_MS` | `8000` | 点了「下一节」页面却没变化时，多久内不再重复点 | 一般不动 |
 | `TASK_POINT_CACHE_MS` | `3000` | 任务点元素的重扫间隔 | 一般不动 |
 
-两条纪律：
+三条纪律：
 
 - **改完必须重新安装脚本**（覆盖），页面里跑着的还是旧代码；
+- **改了行为就要递增版本号**：元数据块的 `@version` 与脚本内的 `SCRIPT_VERSION` **两处一起改**（`1.<轮次>.<补丁>`，见 [`docs/adr/0012`](../adr/0012-release-branch-and-version-scheme.md)），改完跑下面这条确认两处一致：
+
+  ```bash
+  node src/tests/version.test.js
+  ```
+
 - **用例跟着常量走**：`src/tests/decision.test.js` 从调试句柄读 `CONSTANTS`，改数值不会让用例变红。改完照跑一遍确认没踩坏别的：
 
   ```bash
