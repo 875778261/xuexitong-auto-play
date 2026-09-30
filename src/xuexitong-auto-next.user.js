@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         学习通 · 自动播放下一节
 // @namespace    auto-lesson
-// @version      1.0.0
+// @version      1.8.0
 // @description  在目标站点的学习页面上，依次自动播完视频/音频任务点，播完后推进到下一个任务点
 // @author       auto-lesson
 // @match        https://mooc1.xuexitong.com/mycourse/*
+// @updateURL    https://raw.githubusercontent.com/875778261/xuexitong-auto-play/main/src/xuexitong-auto-next.user.js
+// @downloadURL  https://raw.githubusercontent.com/875778261/xuexitong-auto-play/main/src/xuexitong-auto-next.user.js
 // @grant        none
 // @noframes
 // @run-at       document-idle
@@ -17,6 +19,8 @@
 //   平台那张「还有任务点未完成」确认框因此只在章节树不可用的回退路径上才会遇到）、
 // docs/adr/0011（「判定完成」早于媒体播完：媒体还在播就不离开本节点，等它 ended；
 //   安全网那条「树说还有未完成、脚本一个未完成的都没看到」先复查一个窗口期再决定停不停）。
+// 交付与版本号纪律见 docs/adr/0012（@version = 1.<行为轮次>.<补丁>，合入 main 就是「发布」）、
+// docs/adr/0013（页面里怎么确认装的是哪一版）：改了行为就要递增 @version，同时改 SCRIPT_VERSION。
 // 设计依据见 .scratch/xuexitong-auto-next/spec.md；层级是「节点 → 卡片 → 任务点」，见 CONTEXT.md。
 //
 // 本文件分三层：
@@ -27,6 +31,13 @@
 
 (function () {
   'use strict'
+
+  // ============================================================
+  // 版本镜像（与上面元数据块的 @version 必须一致）
+  // ============================================================
+  // 两处都是手工同步的（仓库没有构建链），由 src/tests/version.test.js 断言。
+  // 为什么另挂一条常量、而不去读 GM_info.script.version：见 docs/adr/0013。
+  const SCRIPT_VERSION = '1.8.0'
 
   // ============================================================
   // 参数（唯一调参处）
@@ -1387,6 +1398,7 @@
   // 刻意只暴露决策核心需要的东西：观察值怎么来、动作怎么执行都归适配层，不在这里开口子
   // ============================================================
   globalThis.__xuexitongAutoNext = {
+    VERSION: SCRIPT_VERSION,
     decide: decide,
     initialMemory: initialMemory,
     ACTION: ACTION,
