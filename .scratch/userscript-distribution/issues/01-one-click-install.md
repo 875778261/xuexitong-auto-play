@@ -1,6 +1,6 @@
 # 01 · 一键安装：补 `@downloadURL` / `@updateURL` 并发布
 
-Status: ready-for-human
+Status: done
 
 > 2026-09-30：机制与元数据都已落地，**只剩「人来做发布」这一步**（push `develop` → 建 `main` → 设默认分支），见文末 Comments 与 [`../spec.md`](../spec.md) 的待办。
 
@@ -46,3 +46,7 @@ Status: ready-for-human
 **首次发布已执行（2026-09-30）**：`main` 与 `develop` 都已推到 `origin`（先推 `main`，让它成为仓库默认分支）；匿名 `curl` 实测 `main` 的 raw 为 **200**，取回的正是 `@version 1.8.0` 那一份。
 
 **还差两条只在浏览器里能验的**：① 在没装过脚本的浏览器上点 README 的安装链接 → 弹安装页 → 装完学习页右下角出现状态条；② 改一版 `@version` 重新发布 → 篡改猴面板「检查脚本更新」能拉到新版（顺带别忘了一条相邻的口子：`@grant none` 下 `GM_info` 是否可读 —— 若可读，`ADR 0013` 的结论要重审）。
+
+**Release 已建（2026-09-30）**：tag `v1.8.0` 上建了 GitHub Release，附件 `xuexitong-auto-next.user.js` 的直链实测 **200**。它的定位是**存档与下载**、不承担更新职责（更新源永远只有 `main` 的 raw），见 [`docs/adr/0012`](../../../docs/adr/0012-release-branch-and-version-scheme.md) 末尾那一节。
+
+**本工单收口**：机制、元数据、文档与首次发布都已落地，`Status` 改成 `done`。上面那两条只在浏览器里能验的（含 `GM_info` 那个口子）移交 [`02-browser-acceptance.md`](./02-browser-acceptance.md)。

@@ -4,7 +4,8 @@
 
 因此定两条机制：
 
-- **`main` 是发布分支**。`@updateURL` / `@downloadURL` 都指 `main` 分支的 raw `.user.js`；日常开发留在 `develop`，**合入 `main` 就是「发布」这个动作**。`develop` 上的提交再激进也只影响自己。
+- **`main` 是发布分支**。`@updateURL` / `@downloadURL` 都指 `main` 分支的 raw `.user.js`；日常开发留在 `develop`。**「发布」绑在提交上，不绑在分支上**：一笔**带版本号**的提交合入 `main` 就是发布，而**不带动 `.user.js` 的提交（文档、测试）随时可以合入** `main` —— 后一条是为了让 GitHub 页面上读到的文档不过期，它不破坏前一条（理由见下面「Release / tag 只是存档与下载」）。
+- **`main` 的进入规则是「合提交，不合分支尖端」**：用 `git merge <提交>`，不用 `--ff-only develop`。让 `main` 无脑跟随 `develop` 的尖端，等于给下面那条「用 `develop` 当更新源」留了个入口 —— 一笔还没验证的带号提交会立刻成为使用者的更新源。`develop` 上没有未发布的带号提交时，纯文档提交才可以立刻合过去。
 - **`@version = 1.<行为轮次>.<补丁>`**，首次发布写 `1.8.0`（对应第八轮的行为口径）。MINOR = 一次行为口径变更（= 一轮），PATCH = 脚本改了但行为没变，MAJOR 留给「翻转既有行为边界」那一类（`0009` 反转 `0002` 是一次）。**轮次只数行为变更**，像本 ADR 这种纯交付机制轮不占号。脚本文件有实质改动的那笔提交**自己带号**，纯文档 / 测试改动不动号，merge 到 `main` 也不动号。
 
 ## Considered Options
@@ -18,8 +19,26 @@
 
 ## Consequences
 
-- **发布动作变成三步**：`git push` `develop` → 建 / 合入 `main` → （建议）把 `main` 设为默认分支。`main` 一动，所有装了 `1.8.0` 之后版本的使用者会在下一次更新检查时自动换版。
+- **发布动作是四步语义、三步操作**：合 `main` → 递增 `@version` → **打 tag `v<@version>` 并建 Release**（建 Release 时 GitHub 顺手建 tag，所以第 3、4 步在操作上是同一个动作）。**带号提交**一进 `main`，所有装了 `1.8.0` 之后版本的使用者会在下一次更新检查时自动换版；而文档提交进 `main` 对使用者零影响 —— 那个文件里写的 `@version` 没变。
+- **发布后自检两条**（`@version` 与文件名是最容易打错的两处，而打错是**静默**的：脚本照跑，只是永远更新不到新版）：
+  ```bash
+  # Release 的附件与更新源应是同一份字节（把 v1.8.0 换成刚发布的号）
+  curl -sL https://github.com/875778261/xuexitong-auto-play/releases/download/v1.8.0/xuexitong-auto-next.user.js | md5sum
+  curl -s https://raw.githubusercontent.com/875778261/xuexitong-auto-play/main/src/xuexitong-auto-next.user.js | md5sum
+  ```
+  两条 md5 必须相同。「两处版本号一致」与「两个 URL 都指向 `main` 的这份文件」由 `src/tests/version.test.js` 兜住，不必人手核。
 - **首次发布必须是 `1.8.0`**：严格大于面板里那个 `1.0.0`，否则更新链路静默失效。
 - ⚠️ **README 里那条安装链接只有首次发布之后才点得通**。在 `main` 有内容之前放上去，就是 [`issues/01`](../../.scratch/userscript-distribution/issues/01-one-click-install.md) 亲口否掉的「点不通的链接，比不放更伤信任」。
 - ⚠️ **`raw.githubusercontent.com` 的国内可达性未验证**：不通则 `@updateURL` / `@downloadURL` 改指 jsDelivr 镜像，代价是分支引用约 12 小时缓存，「发布后立刻生效」做不到。这条写在 `.scratch/userscript-distribution/spec.md` 的验收里。
 - **`@version` 从此对外承诺语义**：使用者面板上的号与使用手册里的「第几轮」必须能对上；改号规则由 `src/tests/version.test.js` 兜住一半（元数据与脚本内 `SCRIPT_VERSION` 一致），另一半（「脚本有实质改动就必须已递增」）仍是纪律。
+
+## Release / tag 只是存档与下载，不承担更新职责
+
+`v<@version>` 这个 tag 与它上面的 Release **不参与更新**：`@updateURL` / `@downloadURL` 永远只指 `main` 的 raw `.user.js`。理由就是上面那条被否掉的方案 —— 固定 ref 永远不会自动更新，指过去等于没有更新机制（还要为每一版改一次元数据）。
+
+于是分工是：
+
+- **更新链**：`main` 上那份 raw `.user.js`，唯一会动的一条路；「有没有新版」只看它里面写的 `@version`；
+- **Release / 附件**：给人读的发布说明 + 一份**存档**（历史版本、离线取用、出问题时回溯「那一版到底是什么」）。它是一份**快照**，不会自己更新，也不会因为 `main` 往前走而变。
+
+这条分工正是「`main` 可以带着文档往前走」的前提：文档提交进 `main` 不会触发任何版本变化，因为使用者手里的更新只看那个文件里的 `@version`，而它只在发布时才变。反过来说，**谁要是把 tag 填进 `@updateURL`，就同时失掉自动更新与这个自由度**。

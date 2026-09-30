@@ -1,6 +1,6 @@
 # Spec — 油猴脚本的交付：分发、版本号与更新机制
 
-Status: ready-for-human（发布会话需要人；文档与代码部分已足够具体，可由 agent 落）
+Status: done（机制与首次发布都已落地；两条浏览器验收移交 issues/02）
 
 本 spec 管的是**交付机制**，不是脚本行为：脚本怎么送到使用者手上、使用者拿到的是哪一版、新版本怎么到他们手里。
 脚本行为本身的口径见 [`.scratch/xuexitong-auto-next/spec.md`](../xuexitong-auto-next/spec.md)。
@@ -76,8 +76,8 @@ Status: ready-for-human（发布会话需要人；文档与代码部分已足够
 1. ~~先提交第八轮~~ —— 已提交两笔（`docs` 先行、`feat` 随后）。本轮要改的 `src/xuexitong-auto-next.user.js`、`CONTEXT.md`、`README.md`、`docs/usage/xuexitong-auto-next.md` 与第八轮的改动**完全重叠**，所以这个顺序不能颠倒。
 2. ~~落本轮~~ —— 已落：`ADR 0012` / `ADR 0013`、`CONTEXT.md` 一条术语、元数据两个 URL、`SCRIPT_VERSION` 常量、`src/tests/version.test.js`、三处文档改写、`issues/01` 收口。
 3. ~~提交本轮~~ —— 已按同样的拆法提交（`docs` 先行、`feat` 随后）。
-4. **只剩人要做的一步**：`git push -u origin develop` → 建 `main` 并合入 → 把 `main` 设为默认分支。**发布之前 README 里那条安装链接点不通**（正是 `issues/01` 否掉过的「点不通的链接」），所以这一步要尽快跟上。
-5. 发布后照上面「验收」逐条真机确认，尤其是那两条要先实证的（匿名可达 raw / 使用者的网络直连 raw）。
+4. ~~发布~~ —— 已执行：`git push -u origin develop` → 建 `main` 并合入 → 把 `main` 设为默认分支 → 递增 `@version` → 打 tag `v1.8.0` → 建 GitHub Release 并附 `.user.js`。⚠️ 口径已更新为**四步语义、三步操作**（打 tag 与建 Release 是同一个动作），见 [`docs/adr/0012`](../../docs/adr/0012-release-branch-and-version-scheme.md)。
+5. ~~发布后照「验收」逐条真机确认~~ —— 发布侧两条已闭环（匿名可达 raw、使用者的网络直连 raw）。剩下两条**只在浏览器里能验**的（首装、面板拉新版）已移交 [`issues/02-browser-acceptance.md`](./issues/02-browser-acceptance.md)。
 
 ## Comments
 

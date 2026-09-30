@@ -41,6 +41,8 @@ typeof (window.__xuexitongAutoNext || {}).CONSTANTS.TREE_RECHECK_GRACE_MS   // �
 
 ⚠️ **发布发生在 `main` 分支上**（日常开发在 `develop`）：维护者若刚修好、还没合入 `main`，你这里自然拿不到 —— 那不是更新坏了，见 [`docs/adr/0012`](../adr/0012-release-branch-and-version-scheme.md)。
 
+> 想要**历史版本 / 离线取用**：每个版本在 [Releases](https://github.com/875778261/xuexitong-auto-play/releases) 页上有说明与一份附件。⚠️ 那条路只是**存档** —— 从附件装的那份**不会自动更新**，要自动更新就装 `README` 里那条 `main` 的安装链接。
+
 > 给 agent / 自动化：完整流程（含硬边界）见 [`docs/agents/userscript-install-via-playwright.md`](../agents/userscript-install-via-playwright.md)。那条路上唯一的坑：`playwright-cli` 打开 `.user.js` 的 URL 后**只 `reload` 不会弹安装页**（页面停在裸 JS 文本上），要 **`goto` 同一个 URL** 才会唤起安装页（并另开一个 `chrome-extension://…/ask.html` 标签页）——`tab-select 1` → 点「重新安装」，装完两个标签页都会关掉。
 
 ---
