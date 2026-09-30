@@ -22,11 +22,11 @@
 - **发布动作是四步语义、三步操作**：合 `main` → 递增 `@version` → **打 tag `v<@version>` 并建 Release**（建 Release 时 GitHub 顺手建 tag，所以第 3、4 步在操作上是同一个动作）。**带号提交**一进 `main`，所有装了 `1.8.0` 之后版本的使用者会在下一次更新检查时自动换版；而文档提交进 `main` 对使用者零影响 —— 那个文件里写的 `@version` 没变。
 - **发布后自检两条**（`@version` 与文件名是最容易打错的两处，而打错是**静默**的：脚本照跑，只是永远更新不到新版）：
   ```bash
-  # Release 的附件与更新源应是同一份字节（把 v1.8.0 换成刚发布的号）
-  curl -sL https://github.com/875778261/xuexitong-auto-play/releases/download/v1.8.0/xuexitong-auto-next.user.js | md5sum
+  # 附件拖自 CRLF 工作区、raw 供的是 LF 的 blob —— 先归一行尾再比内容（把 v1.8.0 换成刚发布的号）
+  curl -sL https://github.com/875778261/xuexitong-auto-play/releases/download/v1.8.0/xuexitong-auto-next.user.js | tr -d '\r' | md5sum
   curl -s https://raw.githubusercontent.com/875778261/xuexitong-auto-play/main/src/xuexitong-auto-next.user.js | md5sum
   ```
-  两条 md5 必须相同。「两处版本号一致」与「两个 URL 都指向 `main` 的这份文件」由 `src/tests/version.test.js` 兜住，不必人手核。
+  两条 md5 必须相同。⚠️ **不归一行尾直接比整份文件，一定会「有差异」**（`1.8.0` 实测：附件 71986 字节、raw 70564 字节，差的 1422 字节全是 CR），那**不代表发错了版本** —— 提交进 git 的 blob 与远端 raw 都是 LF，只有工作区（因而从工作区拖上去的附件）是 CRLF。「两处版本号一致」与「两个 URL 都指向 `main` 的这份文件」由 `src/tests/version.test.js` 兜住，不必人手核。
 - **首次发布必须是 `1.8.0`**：严格大于面板里那个 `1.0.0`，否则更新链路静默失效。
 - ⚠️ **README 里那条安装链接只有首次发布之后才点得通**。在 `main` 有内容之前放上去，就是 [`issues/01`](../../.scratch/userscript-distribution/issues/01-one-click-install.md) 亲口否掉的「点不通的链接，比不放更伤信任」。
 - ⚠️ **`raw.githubusercontent.com` 的国内可达性未验证**：不通则 `@updateURL` / `@downloadURL` 改指 jsDelivr 镜像，代价是分支引用约 12 小时缓存，「发布后立刻生效」做不到。这条写在 `.scratch/userscript-distribution/spec.md` 的验收里。
