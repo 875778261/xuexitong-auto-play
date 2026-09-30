@@ -555,6 +555,38 @@ const CASES = [
     expect: { kind: A.JUMP_NODE, nodeId: 'n2' },
   },
   {
+    // docs/adr/0011：平台的「判定完成」可以早于媒体 ended（实测 489 秒的视频在 437 秒就戴上了
+    // ans-job-finished，还剩 53 秒）。那一刻本节点已经没有可播单元，但媒体还在播 ——
+    // 当场走不但少看一截，还会正好撞进「树还没刷新」的那几秒
+    name: '本节点只剩已完成的任务点、但媒体还在播 → 等它播完，不离开节点',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      media: media({ currentTime: 437, paused: false, ended: false }),
+      tree: tree([unfinished('n1', { current: true }), unfinished('n2')]),
+    }),
+    expect: { kind: A.WAIT, pending: null },
+    expectMemory: (m) => m.jumpRequested === null && m.treeMismatch === null,
+  },
+  {
+    name: '同上：媒体播到 ended → 才走「播完固定等一段」那条路',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      media: media({ currentTime: 489, paused: false, ended: true }),
+      tree: tree([unfinished('n1', { current: true }), unfinished('n2')]),
+    }),
+    expect: { kind: A.WAIT, pending: P.ADVANCE_DELAY, pendingDueAt: NOW + C.ADVANCE_DELAY_MS },
+  },
+  {
+    name: '同上：进度长时间不前进 → 仍按「卡住」停下（这条等待不会无限吊着）',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      media: media({ currentTime: 437, paused: false, ended: false }),
+      tree: tree([unfinished('n1', { current: true }), unfinished('n2')]),
+    }),
+    mem: () => memory({ lastSample: { at: NOW - C.STALL_TIMEOUT_MS, currentTime: 437 } }),
+    expect: { kind: A.STOP, reason: R.STALLED },
+  },
+  {
     name: '章节树：当前节点自己还有可播的未完成任务点 → 就地播，不跳',
     obs: observe({
       taskPoints: [video('v1', false)],
@@ -564,12 +596,54 @@ const CASES = [
     expectMemory: (m) => m.jumpRequested === null,
   },
   {
-    name: '章节树说当前节点还有未完成、脚本却一个未完成任务点都没采到 → 停下',
+    name: '章节树说还有未完成、脚本一个未完成的都没采到 → 先给一个复查窗口，不立刻停',
     obs: observe({
       taskPoints: [video('v1', true)],
       tree: tree([unfinished('n1', { current: true }), unfinished('n2')]),
     }),
+    // 倒计时：窗口走完仍不一致才认「判定不可信」（docs/adr/0011）
+    expect: { kind: A.WAIT, pending: P.TREE_UNFINISHED_MISMATCH, pendingDueAt: NOW + C.TREE_RECHECK_GRACE_MS },
+    expectMemory: (m) => !!m.treeMismatch && m.treeMismatch.nodeId === 'n1' && m.treeMismatch.since === NOW,
+  },
+  {
+    name: '同一个节点、复查窗口还没走完 → 继续等，不重置计时',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      tree: tree([unfinished('n1', { current: true }), unfinished('n2')]),
+    }),
+    mem: () => memory({ treeMismatch: { nodeId: 'n1', since: NOW - C.TREE_RECHECK_GRACE_MS + 1 } }),
+    expect: { kind: A.WAIT, pending: P.TREE_UNFINISHED_MISMATCH },
+    expectMemory: (m) => m.treeMismatch.since === NOW - C.TREE_RECHECK_GRACE_MS + 1,
+  },
+  {
+    name: '复查窗口是对着节点算的：换了节点就重新计时（旧账不作数）',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      tree: tree([unfinished('n1', { current: true }), unfinished('n2')]),
+    }),
+    mem: () => memory({ treeMismatch: { nodeId: 'n0', since: NOW - C.TREE_RECHECK_GRACE_MS } }),
+    expect: { kind: A.WAIT, pending: P.TREE_UNFINISHED_MISMATCH, pendingDueAt: NOW + C.TREE_RECHECK_GRACE_MS },
+    expectMemory: (m) => m.treeMismatch.nodeId === 'n1' && m.treeMismatch.since === NOW,
+  },
+  {
+    name: '复查窗口里树刷新了（当前节点已无未完成计数）→ 正常跳走，并把账本清掉',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      tree: tree([treeNode('n1', { current: true }), unfinished('n2')]),
+    }),
+    mem: () => memory({ treeMismatch: { nodeId: 'n1', since: NOW - 1000 } }),
+    expect: { kind: A.JUMP_NODE, nodeId: 'n2' },
+    expectMemory: (m) => m.treeMismatch === null,
+  },
+  {
+    name: '章节树说还有未完成、一个未完成的都没采到、复查窗口也走完了 → 停下',
+    obs: observe({
+      taskPoints: [video('v1', true)],
+      tree: tree([unfinished('n1', { current: true }), unfinished('n2')]),
+    }),
+    mem: () => memory({ treeMismatch: { nodeId: 'n1', since: NOW - C.TREE_RECHECK_GRACE_MS } }),
     expect: { kind: A.STOP, reason: R.TREE_UNFINISHED_NOT_FOUND },
+    expectMemory: (m) => m.pending === null,
   },
   {
     name: '章节树说还有未完成、但采到的都是脚本播不了的（PPT）→ 允许跳过',

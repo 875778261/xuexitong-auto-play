@@ -14,7 +14,9 @@
 // docs/adr/0006（任务点按 jobid 认；只剩资料附件的节点直接推进，不等也不停）、
 // docs/adr/0009（媒体没在播时不再直接停下：自动续播 5 次 → 重启一次脚本 → 再 3 次，才真正停下）、
 // docs/adr/0010（推进 = 从章节树直接跳到当前节点之后的第一个未完成节点，只向前；
-//   平台那张「还有任务点未完成」确认框因此只在章节树不可用的回退路径上才会遇到）。
+//   平台那张「还有任务点未完成」确认框因此只在章节树不可用的回退路径上才会遇到）、
+// docs/adr/0011（「判定完成」早于媒体播完：媒体还在播就不离开本节点，等它 ended；
+//   安全网那条「树说还有未完成、脚本一个未完成的都没看到」先复查一个窗口期再决定停不停）。
 // 设计依据见 .scratch/xuexitong-auto-next/spec.md；层级是「节点 → 卡片 → 任务点」，见 CONTEXT.md。
 //
 // 本文件分三层：
@@ -39,6 +41,10 @@
     UNREADY_TIMEOUT_MS: 30000,        // 页面给不出媒体（或卡片层认不出来），等这么久才放弃
     EMPTY_CARD_GRACE_MS: 3000,        // 本卡片一个任务点都没有时，先按这么久当「还没渲染出来」
     TREE_READY_GRACE_MS: 10000,       // 章节树还没铺好时先等这么久，仍拿不到才回退到「下一节」
+    // 树说本节点还有未完成、脚本却一个未完成的都没看到时，先按这么久复查再决定停不停（ADR 0011）。
+    // 刻意**不**复用 ADVANCE_DELAY_MS：那个是「播完等一段」，手册明确允许用户调小到 5 秒，
+    // 而这个窗口必须大于平台刷新章节树的往返（实测 3–6 秒）—— 两者共用会把这个修复悄悄调坏。
+    TREE_RECHECK_GRACE_MS: 15000,
     ACTION_COOLDOWN_MS: 4000,         // 同类动作的最小重复间隔
     ADVANCE_REPEAT_GUARD_MS: 8000,    // 页面没变化时，不重复点「下一节」
     TASK_POINT_CACHE_MS: 3000,        // 任务点元素的重扫间隔
@@ -63,7 +69,7 @@
     LOGIN_RISK_CONTROL: 'loginRiskControl',
     FACE_CAPTURE_COURSE: 'faceCaptureCourse',
     MEDIA_NOT_FOUND: 'mediaNotFound',        // 也管「跳节点没生效」：那 30 秒内当前节点没变成目标
-    TREE_UNFINISHED_NOT_FOUND: 'treeUnfinishedNotFound', // 树上说本节点还有未完成，脚本却一个未完成任务点都没采到
+    TREE_UNFINISHED_NOT_FOUND: 'treeUnfinishedNotFound', // 树上说本节点还有未完成，脚本却一个未完成任务点都没采到（复查窗口走完仍如此，ADR 0011）
     MEDIA_INCOMPLETE_CONFIRM: 'mediaIncompleteConfirm',
     DIALOG_WITHOUT_UNFINISHED: 'dialogWithoutUnfinished',
     MEDIA_LOAD_FAILED: 'mediaLoadFailed',
@@ -87,6 +93,7 @@
     AUTO_RESUME_AFTER_RESTART: 'autoResumeAfterRestart', // 第二段（重启之后）：还有名额
     RESUME_FINAL: 'resumeFinal',         // 第二段也用尽：等最后一次的结果，没恢复就停下
     STALLED: 'stalled',                  // 在播，但进度不前进
+    TREE_UNFINISHED_MISMATCH: 'treeUnfinishedMismatch', // 树说本节点还有未完成、脚本一个未完成的都没看到：给平台一个复查窗口（ADR 0011）
   }
 
   const KIND = { VIDEO: 'video', AUDIO: 'audio', PPT: 'ppt', UNKNOWN: 'unknown' }
@@ -125,6 +132,9 @@
       unreadySince: null,      // 页面连续给不出「媒体」（或卡片层认不出来）的起点
       emptyCardSince: null,    // 本卡片连续「一个任务点都没有」的起点
       treeUnreadySince: null,  // 章节树连续拿不到的起点（到点就回退到「下一节」，ADR 0010）
+      // 树说本节点还有未完成、脚本却一个未完成任务点都没看到的起点（ADR 0011）。
+      // 带上 nodeId：换个节点就重新计时，免得旧账把新节点的复查窗口提前用光。
+      treeMismatch: null,      // { nodeId, since }
       lastAction: null,        // { kind, at } 上次发出的动作
       advanceSignature: null,  // 上次点「下一节」时看到的任务点签名
       startRequestedKey: null, // 已经替哪个媒体请求过起播（spec：起播不重试）
@@ -390,11 +400,15 @@
       }
     }
 
-    // 8b. 本节点已经没有可播的未完成任务点了 → 当场把注意力挪走（换卡片 / 跳节点），
+    // 8b. 本节点已经没有可播的未完成任务点了 → 把注意力挪走（换卡片 / 跳节点），
     //     别再去按一个**已完成**任务点的播放键 —— 旧行为在「打开一个早已做完的节点」时会先起播一下
     //     它的媒体再推进（ADR 0010 要的正是这段浪费）。
     //     ⚠️ 排在「播完固定等一段」前面时会把那 15 秒吞掉，所以 ended 的那一条要留出口子。
-    if (playable.length === 0 && !(media && media.ended)) return locateOrAdvance()
+    //     ⚠️ 手上这条媒体**正在播**时也不走（ADR 0011）：平台的「判定完成」可以早于 ended —— 实测 489 秒的
+    //     视频在 437 秒（89%，还剩 53 秒）就戴上了 ans-job-finished，而章节树要再等 3–6 秒才把那个计数
+    //     刷新掉。当场走不但少看一截，还会正好撞进那几秒窗口（DOM 说做完了、树说没做完 → 判定不可信）。
+    //     所以：正在播就让它播到底（ended → 第 10 步），播不动了（暂停 / 加载失败 / 卡住）各有自己的出口。
+    if (playable.length === 0 && !(media && (media.ended || !media.paused))) return locateOrAdvance()
 
     // 9. 媒体加载失败 → 先走续播阶梯（原先立刻停；网络抖动时 play() 会重跑资源选择，可能救回来）
     if (media && media.failed) return resumeOrStop(STOP_REASON.MEDIA_LOAD_FAILED)
@@ -445,8 +459,9 @@
       mem = Object.assign({}, mem, { lastSample: null })
     }
 
-    // 13. 本卡片还有未完成的可播任务点、媒体也已经在播 —— 什么都不做
-    if (playable.length > 0 && media) return wait(mem, pending)
+    // 13. 有媒体在播 —— 什么都不做。两条路都落到这里：本卡片还有可播的未完成任务点；
+    //     或者本节点已经没有可播单元、但手上这条刚被平台判定完成的媒体还在播（ADR 0011，第 8b 步没放它走）。
+    if (media) return wait(mem, pending)
 
     // 14. 该去找下一个可播单元了
     return locateOrAdvance()
@@ -510,13 +525,14 @@
     function moveOn() {
       if (tree) {
         mem = Object.assign({}, mem, { treeUnreadySince: null })
-        if (!mayLeaveCurrentNode()) return stop(mem, STOP_REASON.TREE_UNFINISHED_NOT_FOUND)
+        if (!mayLeaveCurrentNode()) return treeMismatchOrStop()
+        mem = Object.assign({}, mem, { treeMismatch: null })
         const target = nextUnfinishedAfter(tree)
         if (!target) return stop(mem, STOP_REASON.COURSE_COMPLETED)
         return jumpTo(target)
       }
       const treeUnreadySince = since(mem.treeUnreadySince, now)
-      mem = Object.assign({}, mem, { treeUnreadySince })
+      mem = Object.assign({}, mem, { treeUnreadySince: treeUnreadySince, treeMismatch: null })
       if (now - treeUnreadySince < C.TREE_READY_GRACE_MS) {
         return wait(mem, pendingOf(PENDING.TREE_NOT_READY, treeUnreadySince + C.TREE_READY_GRACE_MS))
       }
@@ -532,6 +548,23 @@
       const current = currentNodeOf(tree)
       if (!current || !current.unfinished) return true
       return !!(mem.scan && mem.scan.sawUnfinished)
+    }
+
+    // 「解释不清」不立刻停（ADR 0011）：容器的完成态是**客户端当场生效**，章节树的计数要等平台
+    // 自己再发一次 studentstudycourselist 才更新（实测滞后 3–6 秒，见 docs/sites/xuexitong.md）。
+    // 于是「刚播完一个任务点」的那一刻必然出现一边说做完了、一边说还有 —— 那是**正常中转态**，
+    // 不是判定不可信。先给平台一个复查窗口（TREE_RECHECK_GRACE_MS），到期仍不一致才认账停下。
+    // 账本带 nodeId：换个节点重新计时，旧账不会把新节点的窗口提前用光。
+    function treeMismatchOrStop() {
+      const current = currentNodeOf(tree)
+      const nodeId = current ? current.id : ''
+      const previous = mem.treeMismatch
+      const mismatchSince = previous && previous.nodeId === nodeId ? previous.since : now
+      mem = Object.assign({}, mem, { treeMismatch: { nodeId: nodeId, since: mismatchSince } })
+      if (now - mismatchSince >= C.TREE_RECHECK_GRACE_MS) {
+        return stop(mem, STOP_REASON.TREE_UNFINISHED_NOT_FOUND)
+      }
+      return wait(mem, pendingOf(PENDING.TREE_UNFINISHED_MISMATCH, mismatchSince + C.TREE_RECHECK_GRACE_MS))
     }
 
     // 跳节点：同一个目标只跳一次（与 startRequestedKey 同款），
@@ -552,6 +585,7 @@
           lastSample: null,
           unreadySince: null,
           emptyCardSince: null,
+          treeMismatch: null,
         }),
       }
     }
@@ -1178,8 +1212,8 @@
     faceCaptureCourse: '这门课启用了人脸抓拍，脚本无法自动化，已放弃',
     mediaNotFound: '一直没找到可播的视频/音频元素，等了 ' + secs(C.UNREADY_TIMEOUT_MS) +
       ' 秒也没有，已停下 —— 可能是任务点结构变了、卡片层认不出来，或跳节点没生效',
-    treeUnfinishedNotFound: '章节树说本节点还有未完成，脚本扫遍全部卡片却一个未完成任务点都没看到 —— ' +
-      '判定不可信（多半是任务点的容器变了），已停下',
+    treeUnfinishedNotFound: '章节树说本节点还有未完成，脚本扫遍全部卡片却一个未完成任务点都没看到，' +
+      '又等了 ' + secs(C.TREE_RECHECK_GRACE_MS) + ' 秒复查仍是如此 —— 判定不可信（多半是任务点的容器变了），已停下',
     mediaIncompleteConfirm: '平台弹出了「还有任务点未完成」，但脚本还没把本节点的可播任务点找完/播完 —— 判断不可信，脚本不替你确认',
     dialogWithoutUnfinished: '平台弹出「还有任务点未完成」，但脚本扫遍本节点却一个未完成任务点都没看到 —— 判定不可信，已停下',
     mediaLoadFailed: '视频/音频加载失败，已停下' + RESUME_EXHAUSTED,
@@ -1212,6 +1246,8 @@
     },
     [PENDING.RESUME_FINAL]: function (s) { return '再等 ' + s + ' 秒仍没恢复就停下' },
     [PENDING.STALLED]: function (s) { return '再等 ' + s + ' 秒没进度就停下' },
+    // 放弃类：到期仍不一致就停 —— 措辞与「再等 N 秒仍没恢复就停下」同款
+    [PENDING.TREE_UNFINISHED_MISMATCH]: function (s) { return '再等 ' + s + ' 秒复查章节树（仍不一致就停下）' },
   }
 
   // 一个 tick 里只登记一条等待（决策核心保证），这里只负责把它翻成一句话
